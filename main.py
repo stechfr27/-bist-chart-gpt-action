@@ -19,7 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "3.2.0-browserless-remote"
+APP_VERSION = "3.3.0-tv-error-reject-full-fallback"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -320,6 +320,7 @@ async def click_soft_popups(page: Page):
         "button[aria-label='Close']", "button[aria-label='Kapat']", "button[data-name='close']",
         "button:has-text('Accept')", "button:has-text('Kabul')", "button:has-text('Tümünü kabul et')",
         "button:has-text('I understand')", "button:has-text('Anladım')", "button:has-text('Later')",
+        "button:has-text('Tamam')",
     ]
     for selector in selectors:
         try:
@@ -327,6 +328,37 @@ async def click_soft_popups(page: Page):
             await page.wait_for_timeout(250)
         except Exception:
             pass
+
+
+async def page_has_tradingview_symbol_error(page: Page) -> tuple[bool, str]:
+    """Detect TradingView pages/widgets that loaded UI but not the requested chart.
+    This prevents returning screenshots of "symbol unavailable" / loading / notification screens.
+    """
+    error_patterns = [
+        "Sembol mevcut degil", "Sembol mevcut değil",
+        "Sembol sadece", "TradingView'de bulunabilir", "TradingView’de bulunabilir",
+        "Symbol is only available", "Symbol not available", "symbol is not available",
+        "Invalid symbol", "No data here", "Try another symbol",
+        "Analiziniz icin baska", "Analiziniz için başka",
+        "Sembolu degistir", "Sembolü değiştir",
+    ]
+    try:
+        body_text = await page.locator("body").inner_text(timeout=1200)
+        body_text = repair_mojibake(body_text)
+        body_text_ascii = to_ascii_tr(body_text)
+        for pat in error_patterns:
+            if pat.lower() in body_text.lower() or to_ascii_tr(pat).lower() in body_text_ascii.lower():
+                return True, f"TradingView symbol/error message detected: {to_ascii_tr(pat)}"
+    except Exception:
+        pass
+    # Modal text can be rendered in nested components; check common visible text selectors too.
+    for pat in error_patterns[:8]:
+        try:
+            if await page.get_by_text(pat, exact=False).first.is_visible(timeout=300):
+                return True, f"TradingView visible error detected: {to_ascii_tr(pat)}"
+        except Exception:
+            pass
+    return False, ""
 
 
 def screenshot_has_chart_content(path: Path) -> bool:
@@ -400,10 +432,20 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
                 except Exception:
                     pass
             try:
+                tv_error, tv_error_note = await page_has_tradingview_symbol_error(page)
+                if tv_error:
+                    last_validation_note = f"attempt {attempt}: {tv_error_note}"
+                    # Do not keep this screenshot/candidate; continue to next TradingView path.
+                    break
                 verified_image = await capture_and_validate(page, out_path, img_type, 78 if img_type == "jpeg" else 0)
                 if verified_image:
+                    # Re-check after screenshot; some widgets show an error modal after canvas boot.
+                    tv_error, tv_error_note = await page_has_tradingview_symbol_error(page)
+                    if tv_error:
+                        last_validation_note = f"attempt {attempt}: rejected after screenshot: {tv_error_note}"
+                        break
                     status = "ok" if canvas_found else "ok_visual_verified"
-                    note = f"TradingView {source_kind} screenshot captured and visual content check passed."
+                    note = f"TradingView {source_kind} screenshot captured and visual content check passed; no symbol/error overlay detected."
                     return out_path, f"/screenshots/{filename}", status, note
                 last_validation_note = f"attempt {attempt}: image looked blank/loading"
             except Exception as shot_error:
@@ -413,7 +455,7 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
                 out_path.unlink()
         except Exception:
             pass
-        return None, None, "chart_loading_not_captured", f"TradingView {source_kind} did not pass visual validation; blank/loading image was rejected. {last_validation_note}"
+        return None, None, "chart_loading_not_captured", f"TradingView {source_kind} did not pass validation; blank/loading/symbol-error image was rejected. {last_validation_note}"
     except Exception as e:
         try:
             if out_path.exists():
