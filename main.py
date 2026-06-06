@@ -19,7 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "3.0.0-strict-tradingview-image"
+APP_VERSION = "3.1.0-warmup-browser-only"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -174,17 +174,27 @@ def health():
 
 @app.get("/warmup")
 async def warmup():
+    """Start Chromium/context only.
+
+    Do not navigate to TradingView here. Some free hosts can open Chromium but
+    time out on TradingView during warmup; that made a healthy service look
+    broken. The real TradingView load is tested only by /chart.
+    """
     try:
         ctx = await BROWSER.get_context()
         page = await ctx.new_page()
-        await install_fast_routes(page)
-        await page.goto("https://tr.tradingview.com/chart/", wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(5000)
+        await page.goto("about:blank", wait_until="load", timeout=8000)
         await page.close()
-        return {"ok": True, "version": APP_VERSION, "browser_started_at": BROWSER.started_at}
+        return {
+            "ok": True,
+            "version": APP_VERSION,
+            "browser_started_at": BROWSER.started_at,
+            "warmup_mode": "browser_only",
+            "note": "Chromium context is ready. TradingView is intentionally not loaded during warmup; use /chart to test real chart capture."
+        }
     except Exception as e:
         await BROWSER.reset()
-        raise HTTPException(status_code=503, detail=f"Warmup başarısız: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=503, detail=f"Warmup failed before TradingView: {type(e).__name__}: {e}")
 
 def normalize_symbol(symbol: str) -> str:
     s = symbol.upper().replace(".IS", "").replace("BIST:", "").strip()
