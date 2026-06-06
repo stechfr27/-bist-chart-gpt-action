@@ -8,3 +8,7 @@ Rules:
 - Treat screenshot_url as mandatory for chart analysis. If screenshot_url is null, say the real TradingView chart could not be captured and do not pretend to analyze candles.
 - Quote snapshots are secondary verification only; they never replace the TradingView candlestick chart.
 - Do not analyze loading/blank/symbol-error screenshots.
+
+
+## v3.8 chart-only note
+Screenshots crop out the TradingView right watchlist/info sidebar by default. Price, change, volume and context should be read from quote_snapshots / Midas / BloombergHT fields, while the image is used primarily for candle and volume-bar analysis. Use CHART_ONLY_SCREENSHOT=false only if you explicitly want the full sidebar in the image.

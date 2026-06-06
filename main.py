@@ -19,15 +19,15 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "3.6.0-session-zoom-fit"
+APP_VERSION = "3.8.0-chart-only-external-info"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
 QUOTE_CACHE_TTL_SECONDS = int(os.getenv("QUOTE_CACHE_TTL_SECONDS", "180"))
 TRADINGVIEW_COOKIE = os.getenv("TRADINGVIEW_COOKIE", "").strip()
 BROWSERLESS_WS_ENDPOINT = os.getenv("BROWSERLESS_WS_ENDPOINT", "").strip()
-TV_VIEWPORT_WIDTH = int(os.getenv("TV_VIEWPORT_WIDTH", "1920"))
-TV_VIEWPORT_HEIGHT = int(os.getenv("TV_VIEWPORT_HEIGHT", "1080"))
+TV_VIEWPORT_WIDTH = int(os.getenv("TV_VIEWPORT_WIDTH", "2200"))
+TV_VIEWPORT_HEIGHT = int(os.getenv("TV_VIEWPORT_HEIGHT", "1152"))
 TV_WAIT_CURRENT_MS = int(os.getenv("TV_WAIT_CURRENT_MS", "1200"))
 TV_WAIT_BALANCED_MS = int(os.getenv("TV_WAIT_BALANCED_MS", "9000"))
 TV_CANVAS_WAIT_CURRENT_MS = int(os.getenv("TV_CANVAS_WAIT_CURRENT_MS", "1200"))
@@ -44,10 +44,13 @@ TV_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_SAFE_CURRENT_HARD_TIMEO
 TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS", "95"))
 TOTAL_BALANCED_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_BALANCED_HARD_TIMEOUT_SECONDS", "115"))
 USE_WIDGET_FOR_CURRENT = os.getenv("USE_WIDGET_FOR_CURRENT", "true").lower() in {"1", "true", "yes", "on"}
-SESSION_ZOOM_STEPS = int(os.getenv("SESSION_ZOOM_STEPS", "5"))
-SESSION_ZOOM_WHEEL_DELTA = int(os.getenv("SESSION_ZOOM_WHEEL_DELTA", "-520"))
-SESSION_ZOOM_X_RATIO = float(os.getenv("SESSION_ZOOM_X_RATIO", "0.70"))
-SESSION_ZOOM_Y_RATIO = float(os.getenv("SESSION_ZOOM_Y_RATIO", "0.55"))
+SESSION_ZOOM_STEPS = int(os.getenv("SESSION_ZOOM_STEPS", "8"))
+SESSION_ZOOM_WHEEL_DELTA = int(os.getenv("SESSION_ZOOM_WHEEL_DELTA", "-620"))
+SESSION_ZOOM_X_RATIO = float(os.getenv("SESSION_ZOOM_X_RATIO", "0.74"))
+SESSION_ZOOM_Y_RATIO = float(os.getenv("SESSION_ZOOM_Y_RATIO", "0.58"))
+CHART_ONLY_SCREENSHOT = os.getenv("CHART_ONLY_SCREENSHOT", "true").lower() in {"1", "true", "yes", "on"}
+CHART_CLIP_WIDTH_RATIO = float(os.getenv("CHART_CLIP_WIDTH_RATIO", "0.78"))
+CHART_CLIP_HEIGHT_RATIO = float(os.getenv("CHART_CLIP_HEIGHT_RATIO", "0.985"))
 
 TV_INTERVALS = {"1m": "1", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "1h": "60", "1d": "D"}
 YF_INTERVALS = {"1m": "1m", "3m": "5m", "5m": "5m", "10m": "15m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d"}
@@ -186,7 +189,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO}}
 
 @app.get("/warmup")
 async def warmup():
@@ -464,10 +467,22 @@ def screenshot_has_chart_content(path: Path) -> bool:
         return False
 
 async def capture_and_validate(page: Page, out_path: Path, img_type: str, quality: int) -> bool:
+    # Chart-only screenshot: crop out the TradingView right watchlist/details sidebar.
+    # The numeric price scale remains visible on the right edge of the chart pane, but
+    # the watchlist/symbol-info panel is excluded. Those details are returned separately
+    # from Midas/BloombergHT quote snapshots, so GPT focuses on the candles.
+    clip = None
+    if CHART_ONLY_SCREENSHOT:
+        clip = {
+            "x": 0,
+            "y": 0,
+            "width": max(800, int(TV_VIEWPORT_WIDTH * CHART_CLIP_WIDTH_RATIO)),
+            "height": max(600, int(TV_VIEWPORT_HEIGHT * CHART_CLIP_HEIGHT_RATIO)),
+        }
     if img_type == "jpeg":
-        await page.screenshot(path=str(out_path), full_page=False, type="jpeg", quality=quality, timeout=7000)
+        await page.screenshot(path=str(out_path), full_page=False, type="jpeg", quality=quality, timeout=7000, clip=clip)
     else:
-        await page.screenshot(path=str(out_path), full_page=False, type="png", timeout=14000)
+        await page.screenshot(path=str(out_path), full_page=False, type="png", timeout=14000, clip=clip)
     return screenshot_has_chart_content(out_path)
 
 async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str, source_kind: str, view: str = "session", target_date: Optional[str] = None) -> tuple[Optional[Path], Optional[str], str, str]:
@@ -620,7 +635,7 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
             )
             notes.append(note)
             if out_path and shot_path:
-                return out_path, shot_path, "ok_tradingview_local_widget", note + " | Exact TradingView chart path: local widget; session-zoom view attempts to show the latest BIST session open-to-close with readable 5m candles and right-side chart/info area when available."
+                return out_path, shot_path, "ok_tradingview_local_widget", note + " | Exact TradingView chart path: local widget; session-zoom view attempts to show the latest BIST session open-to-close with readable 5m candles and chart area; external quote fields provide price/stat context."
 
         # 2) Official lightweight widgetembed.
         if mode in {"current", "fast", "safe_current"} and USE_WIDGET_FOR_CURRENT and view not in {"session", "full_day", "day"}:
@@ -634,7 +649,7 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
             )
             notes.append(note)
             if out_path and shot_path:
-                return out_path, shot_path, "ok_tradingview_widgetembed", note + " | Exact TradingView chart path: official widgetembed; session-zoom view attempts to show the latest BIST session open-to-close with readable 5m candles and right-side chart/info area when available."
+                return out_path, shot_path, "ok_tradingview_widgetembed", note + " | Exact TradingView chart path: official widgetembed; session-zoom view attempts to show the latest BIST session open-to-close with readable 5m candles and chart area; external quote fields provide price/stat context."
 
         # 3) Full TradingView chart, most complete but heaviest.
         full_budget = (55 if (mode in {"current", "fast"} and view in {"session", "full_day", "day"}) else (38 if mode in {"current", "fast"} else (70 if mode == "safe_current" else hard_timeout)))
@@ -646,7 +661,7 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
         )
         notes.append(note)
         if out_path and shot_path:
-            return out_path, shot_path, "ok_tradingview_full_chart", " | ".join(notes + ["Exact TradingView chart path: full chart; session_zoom tries to focus the latest BIST session open-to-close, expands 5m candles, and keeps the right-side symbol info/statistics panel visible when TradingView renders it."])
+            return out_path, shot_path, "ok_tradingview_full_chart", " | ".join(notes + ["Exact TradingView chart path: full chart; session_tight_fit aggressively zooms the latest BIST session so the previous day is minimized, 5m candles are more readable, and the right-side watchlist/info panel is cropped out; quote/stat context is returned separately in quote_snapshots."])
 
         return None, None, "strict_tradingview_image_failed", " | ".join(notes + ["No verified TradingView chart image returned. No public quote-page fallback was used, because user requested the actual chart screenshot only."])
 
@@ -976,8 +991,8 @@ async def chart(
         yahoo_interval_used=YF_INTERVALS.get(interval, "5m"),
         range_hint=range_hint,
         target_date=target_date,
-        source_chart="TradingView visual chart screenshot via Browserless remote browser if configured, otherwise local Playwright; session-zoom viewport focuses the latest trading day open-to-close plus right-side symbol info panel",
-        source_data="Strict TradingView image-first capture with session-zoom and right-sidebar market info visible; no non-chart visual fallback; quotes are secondary and non-blocking",
+        source_chart="TradingView visual chart screenshot via Browserless remote browser if configured, otherwise local Playwright; session-tight-fit viewport focuses the latest BIST trading session open-to-close while the right-side watchlist/info panel is excluded from the screenshot",
+        source_data="Strict TradingView image-first capture with session-tight-fit chart-only capture; Midas/BloombergHT provide external market info; no non-chart visual fallback; quotes are secondary and non-blocking",
         tradingview_url=tv_url,
         screenshot_url=screenshot_url,
         screenshot_base64_png=screenshot_base64,
