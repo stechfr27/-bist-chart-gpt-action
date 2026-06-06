@@ -19,7 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "5.3.0-range-core-debug-budgeted"
+APP_VERSION = "5.4.0-range-attempt-json-debug"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -185,6 +185,7 @@ class ChartResponse(BaseModel):
     screenshot_url: Optional[str] = None
     screenshot_base64_png: Optional[str] = Field(default=None, description="include_base64=true ise gelir; aksi halde null döner.")
     chart_status: str
+    range_attempt: dict = Field(default_factory=dict)
     ohlc_sample: list[dict]
     ohlc_count: int
     quote_snapshots: list[dict] = Field(default_factory=list)
@@ -211,7 +212,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END, "strict_note": BIST_SESSION_STRICT_NOTE}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO, "image_detect_last_candle": TV_IMAGE_DETECT_LAST_CANDLE}, "custom_range": {"enabled": TV_USE_CUSTOM_RANGE, "core": TV_CUSTOM_RANGE_CORE, "max_seconds": TV_CUSTOM_RANGE_MAX_SECONDS, "session_start": TV_CUSTOM_RANGE_START, "session_end": TV_CUSTOM_RANGE_END, "current_plus_minutes": TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES}}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END, "strict_note": BIST_SESSION_STRICT_NOTE}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO, "image_detect_last_candle": TV_IMAGE_DETECT_LAST_CANDLE}, "custom_range": {"enabled": TV_USE_CUSTOM_RANGE, "core": TV_CUSTOM_RANGE_CORE, "max_seconds": TV_CUSTOM_RANGE_MAX_SECONDS, "session_start": TV_CUSTOM_RANGE_START, "session_end": TV_CUSTOM_RANGE_END, "current_plus_minutes": TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES, "range_attempt_json": True}}
 
 @app.get("/warmup")
 async def warmup():
@@ -426,6 +427,50 @@ def build_target_session_window(target_date: Optional[str]) -> dict:
         "start_label": start_dt.strftime("%d.%m.%Y %H:%M"),
         "end_label": end_dt.strftime("%d.%m.%Y %H:%M"),
         "date_label": start_dt.strftime("%d.%m.%Y"),
+    }
+
+
+def build_range_attempt_summary(target_date: Optional[str], view: str, chart_status: str = "", chart_note: str = "") -> dict:
+    """Always expose the custom-range target and debug state as JSON.
+
+    Previous v5.3 wrote range_attempt only into an internal page note. If Browserless
+    or the top-level timeout closed the task before that note returned, the API response
+    showed no range debug. This object is computed before capture and returned even on
+    timeout/null screenshots.
+    """
+    window = build_target_session_window(target_date)
+    note = chart_note or ""
+    stages = []
+    for part in note.split("|"):
+        part = part.strip()
+        if part.startswith("stage=") or part.startswith("range_attempt") or part.startswith("target_") or part.startswith("custom range"):
+            stages.append(part)
+    if not stages and "range_attempt" in note:
+        stages.append(note)
+    if chart_status in {"request_timeboxed_no_image", "strict_tradingview_image_failed"} or "timeboxed" in note.lower():
+        status = "capture_or_range_timeboxed"
+    elif "failed" in note.lower() or "error" in note.lower():
+        status = "failed"
+    elif "screenshot captured" in note.lower() or chart_status.startswith("ok"):
+        status = "image_captured_verify_x_axis"
+    else:
+        status = "started_or_no_internal_note"
+    return {
+        "enabled": bool(TV_USE_CUSTOM_RANGE),
+        "core": bool(TV_CUSTOM_RANGE_CORE),
+        "view": view,
+        "target_date": target_date,
+        "target_start": window["start_label"],
+        "target_end": window["end_label"],
+        "session_start": TV_CUSTOM_RANGE_START,
+        "session_end": TV_CUSTOM_RANGE_END,
+        "current_plus_minutes": TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES,
+        "max_seconds": TV_CUSTOM_RANGE_MAX_SECONDS,
+        "status": status,
+        "chart_status": chart_status,
+        "stages": stages,
+        "raw_note_excerpt": note[:900],
+        "strict_rule": "current: today 09:55 -> Istanbul now +1m capped 18:10; historical: target date 09:55 -> 18:10; 5m only; do not claim exact session unless x-axis visually confirms it."
     }
 
 async def try_tradingview_custom_date_range(page: Page, target_date: Optional[str], view: str) -> str:
@@ -1368,6 +1413,8 @@ async def chart(
     if include_base64 and out_path and out_path.exists():
         screenshot_base64 = base64.b64encode(out_path.read_bytes()).decode("utf-8")
 
+    range_attempt = build_range_attempt_summary(target_date, view, chart_status, chart_note)
+
     final_note = to_ascii_tr(
         f"{chart_note} | Screenshot cleanup before capture: deleted={clear_result.get('deleted', 0)}, kept={clear_result.get('kept', 0)}. | {data_note} | Ucretsiz kaynaklarda BIST intraday verileri gecikmeli/sinirli/eksik olabilir. "
         "Mikro yapi, derinlik, AKD/BOFA ve karanlik oda icin araci kurum ekrani gerekir. "
@@ -1387,6 +1434,7 @@ async def chart(
         screenshot_url=screenshot_url,
         screenshot_base64_png=screenshot_base64,
         chart_status=chart_status,
+        range_attempt=range_attempt,
         ohlc_sample=records,
         ohlc_count=len(records),
         quote_snapshots=quote_snapshots,

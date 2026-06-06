@@ -1,4 +1,4 @@
-# BIST Chart GPT Action v5.3
+# BIST Chart GPT Action v5.4
 
 Range-core debug/budgeted build.
 
