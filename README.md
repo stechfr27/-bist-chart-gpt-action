@@ -1,45 +1,64 @@
-# BIST Chart GPT Action v1.3
+# BIST Chart GPT Action API v1.5 Final
 
-Bu servis, Custom GPT Action üzerinden BIST hisseleri için grafik ekran görüntüsü ve çok kaynaklı fiyat/veri teyidi döndürür.
+Bu proje ChatGPT Custom GPT Actions ile kullanılmak üzere hazırlanmış BIST grafik servisidir.
 
-## Kaynak mantığı
+## Ne yapar?
 
-- TradingView: ana mum grafik screenshot kaynağı.
-- Yahoo Finance: OHLC doğrulama / eksik veri tamamlama.
-- Stooq: Yahoo tıkanırsa günlük OHLC fallback.
-- Midas Canlı Borsa: ücretsiz web fiyat teyidi, sayfada 15 dakika gecikme notu bulunur.
-- BloombergHT Borsa: görünür borsa tablolarından özet fiyat/hacim teyidi.
-- Investing.com TR: görünür piyasa listelerinden özet fiyat teyidi.
-- Borsa İstanbul: resmi veri/duyuru/günlük bülten referansı; ücretsiz canlı intraday mum kaynağı gibi kullanılmaz.
+- TradingView üzerinde BIST sembolünü açar ve mum grafik screenshot alır.
+- Yahoo Finance üzerinden `.IS` sembolüyle OHLC verisi dener.
+- Yahoo rate limit/boş veri verirse Stooq günlük OHLC fallback dener.
+- Midas, BloombergHT ve Investing gibi ücretsiz public sayfalardan ek quote/context teyidi alır.
+- Borsa İstanbul'u resmi referans katmanı olarak döndürür.
+- TradingView geç yüklenirse API tamamen patlamaz; screenshot başarısız olsa bile veri katmanlarını döndürür.
+- Kalıcı Playwright browser/context kullanır. Bu, her istekte Chromium'u sıfırdan açmaktan daha stabildir.
 
 ## Deploy
 
-1. Dosyaları GitHub reposuna yükle.
-2. Render'da Web Service oluştur.
+1. Dosyaları GitHub repo köküne yükle.
+2. Render üzerinde Web Service oluştur.
 3. Runtime olarak Docker kullan.
-4. Deploy sonrası `/health` endpoint'ini test et.
+4. Deploy sonrası kontrol:
 
-Beklenen health cevabı:
-
-```json
-{"ok":true,"service":"bist-chart-gpt-action","version":"1.3.0-public-source-fallbacks"}
+```text
+https://SENIN-URL.onrender.com/health
 ```
 
-## Test
+Beklenen sürüm:
+
+```json
+{"version":"1.5.0-final-resilient-gpt-action"}
+```
+
+## Warmup
+
+Render free plan uyandığında ilk TradingView isteği yavaş olabilir. Önce bunu çağırabilirsin:
+
+```text
+https://SENIN-URL.onrender.com/warmup
+```
+
+## Grafik testi
 
 ```text
 https://SENIN-URL.onrender.com/chart?symbol=THYAO&interval=5m&range_hint=5d
 ```
 
-Cevapta şunları görmelisin:
+## Custom GPT Action
 
-- `screenshot_url`
-- `ohlc_sample`
-- `quote_snapshots`
-- `official_reference`
-- `data_status`
-- `data_note`
+`openapi_schema_for_gpt_action.json` içindeki server URL'ini kendi Render URL'inle değiştir.
+Sonra Custom GPT > Configure > Actions > Create new action içine schema'yı yapıştır.
 
-## Notlar
+## Opsiyonel TradingView Cookie
 
-Ücretsiz kaynaklar intraday mum verisini her zaman eksiksiz sağlamaz. Bu yüzden sistem görsel grafik + sayısal doğrulama + ek fiyat teyidi mantığıyla çalışır. Emir defteri, AKD/BOFA, karanlık oda ve derinlik verisi için aracı kurum ekranı gerekir.
+TradingView public sayfası sık engel çıkarırsa Render environment variable olarak şunu ekleyebilirsin:
+
+```text
+TRADINGVIEW_COOKIE=...
+```
+
+Bunu paylaşma. Hesap/session bilgisi içerebilir.
+
+## Dürüst veri notu
+
+Ücretsiz kaynaklarda BIST intraday veri gecikmeli, sınırlı veya dönemsel olarak eksik olabilir.
+Derinlik, AKD/BOFA, karanlık oda ve emir defteri için aracı kurum ekranı gerekir.

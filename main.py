@@ -3,56 +3,87 @@ import os
 import re
 import time
 import uuid
-import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Optional
+from threading import Lock
+from typing import Optional
 
 import pandas as pd
+import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "1.3.0-public-source-fallbacks"
+APP_VERSION = "1.5.0-final-resilient-gpt-action"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-
-OHLC_CACHE: dict[str, tuple[float, list[dict], str, str, str]] = {}
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
+QUOTE_CACHE_TTL_SECONDS = int(os.getenv("QUOTE_CACHE_TTL_SECONDS", "120"))
+TRADINGVIEW_COOKIE = os.getenv("TRADINGVIEW_COOKIE", "").strip()
 
-app = FastAPI(
-    title="BIST Chart GPT Action API",
-    description="TradingView mum grafik ekran görüntüsü + Yahoo Finance/Stooq + Midas/Investing/BloombergHT/Borsa İstanbul doğrulama katmanlı servis.",
-    version=APP_VERSION,
-)
-app.mount("/screenshots", StaticFiles(directory=str(SCREENSHOT_DIR)), name="screenshots")
-
-TV_INTERVALS = {
-    "1m": "1",
-    "3m": "3",
-    "5m": "5",
-    "10m": "10",
-    "15m": "15",
-    "30m": "30",
-    "1h": "60",
-    "1d": "D",
-}
-
-YF_INTERVALS = {
-    "1m": "1m",
-    "3m": "5m",     # Yahoo 3m desteklemez; en yakın güvenli doğrulama 5m.
-    "5m": "5m",
-    "10m": "15m",   # Yahoo 10m desteklemez; en yakın güvenli doğrulama 15m.
-    "15m": "15m",
-    "30m": "30m",
-    "1h": "60m",
-    "1d": "1d",
-}
-
+TV_INTERVALS = {"1m": "1", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "1h": "60", "1d": "D"}
+YF_INTERVALS = {"1m": "1m", "3m": "5m", "5m": "5m", "10m": "15m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d"}
 YF_ALLOWED_PERIODS = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"}
 
+OHLC_CACHE: dict[str, tuple[float, list[dict], str, str, str]] = {}
+QUOTE_CACHE: dict[str, tuple[float, list[dict], dict]] = {}
+
+class BrowserManager:
+    def __init__(self):
+        self._lock = Lock()
+        self._pw = None
+        self._browser: Optional[Browser] = None
+        self._context: Optional[BrowserContext] = None
+        self.started_at = None
+
+    def get_context(self) -> BrowserContext:
+        with self._lock:
+            if self._context:
+                return self._context
+            self._pw = sync_playwright().start()
+            self._browser = self._pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-features=IsolateOrigins,site-per-process"],
+            )
+            extra_headers = {}
+            if TRADINGVIEW_COOKIE:
+                extra_headers["Cookie"] = TRADINGVIEW_COOKIE
+            self._context = self._browser.new_context(
+                viewport={"width": 1440, "height": 950},
+                device_scale_factor=1,
+                locale="tr-TR",
+                timezone_id="Europe/Istanbul",
+                extra_http_headers=extra_headers,
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+            )
+            self.started_at = datetime.now(timezone.utc).isoformat()
+            return self._context
+
+    def reset(self):
+        with self._lock:
+            try:
+                if self._context:
+                    self._context.close()
+            except Exception:
+                pass
+            try:
+                if self._browser:
+                    self._browser.close()
+            except Exception:
+                pass
+            try:
+                if self._pw:
+                    self._pw.stop()
+            except Exception:
+                pass
+            self._pw = None
+            self._browser = None
+            self._context = None
+            self.started_at = None
+
+BROWSER = BrowserManager()
 
 class ChartResponse(BaseModel):
     symbol: str
@@ -64,21 +95,48 @@ class ChartResponse(BaseModel):
     source_chart: str
     source_data: str
     tradingview_url: str
-    screenshot_url: str
-    screenshot_base64_png: Optional[str] = Field(default=None, description="include_base64=true ise gelir; aksi halde cevap şişmesin diye null döner.")
+    screenshot_url: Optional[str] = None
+    screenshot_base64_png: Optional[str] = Field(default=None, description="include_base64=true ise gelir; aksi halde null döner.")
+    chart_status: str
     ohlc_sample: list[dict]
     ohlc_count: int
-    quote_snapshots: list[dict] = Field(default_factory=list, description="Midas/Investing/BloombergHT gibi ücretsiz web kaynaklarından çekilen anlık/özet fiyat teyitleri.")
-    official_reference: dict = Field(default_factory=dict, description="Borsa İstanbul resmi site referans/erişim durumu; intraday mum verisi yerine resmi kaynak bağlantısı/teyit notu.")
+    quote_snapshots: list[dict] = Field(default_factory=list)
+    official_reference: dict = Field(default_factory=dict)
     data_status: str
     data_note: str
     captured_at_utc: str
 
+app = FastAPI(
+    title="BIST Chart GPT Action API",
+    description="ChatGPT Actions uyumlu BIST grafik servisi: TradingView screenshot + Yahoo/Stooq/Midas/BloombergHT/Investing/Borsa İstanbul doğrulama katmanları.",
+    version=APP_VERSION,
+)
+app.mount("/screenshots", StaticFiles(directory=str(SCREENSHOT_DIR)), name="screenshots")
+
+@app.on_event("shutdown")
+def shutdown_event():
+    BROWSER.reset()
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "endpoints": ["/health", "/warmup", "/chart"]}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at}
 
+@app.get("/warmup")
+def warmup():
+    try:
+        ctx = BROWSER.get_context()
+        page = ctx.new_page()
+        page.goto("https://tr.tradingview.com/chart/", wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(5000)
+        page.close()
+        return {"ok": True, "version": APP_VERSION, "browser_started_at": BROWSER.started_at}
+    except Exception as e:
+        BROWSER.reset()
+        raise HTTPException(status_code=503, detail=f"Warmup başarısız: {type(e).__name__}: {e}")
 
 def normalize_symbol(symbol: str) -> str:
     s = symbol.upper().replace(".IS", "").replace("BIST:", "").strip()
@@ -89,61 +147,151 @@ def normalize_symbol(symbol: str) -> str:
         raise HTTPException(status_code=400, detail="Sembol çok uzun görünüyor. Örn: THYAO, ASELS, TUPRS")
     return s
 
-
 def make_yahoo_symbol(symbol: str) -> str:
     return f"{normalize_symbol(symbol)}.IS"
 
-
 def make_tv_url(symbol: str, interval: str) -> str:
-    tv_interval = TV_INTERVALS.get(interval, "5")
-    return f"https://tr.tradingview.com/chart/?symbol=BIST:{symbol}&interval={tv_interval}"
-
+    return f"https://tr.tradingview.com/chart/?symbol=BIST:{symbol}&interval={TV_INTERVALS.get(interval, '5')}"
 
 def absolute_url(request: Request, path: str) -> str:
-    base = str(request.base_url).rstrip("/")
-    return f"{base}{path}"
+    return f"{str(request.base_url).rstrip('/')}{path}"
 
+def click_soft_popups(page: Page):
+    selectors = [
+        "button[aria-label='Close']", "button[aria-label='Kapat']", "button[data-name='close']",
+        "button:has-text('Accept')", "button:has-text('Kabul')", "button:has-text('Tümünü kabul et')",
+        "button:has-text('I understand')", "button:has-text('Anladım')", "button:has-text('Later')",
+    ]
+    for selector in selectors:
+        try:
+            page.locator(selector).first.click(timeout=600)
+            page.wait_for_timeout(250)
+        except Exception:
+            pass
 
-def screenshot_tradingview(url: str, symbol: str, interval: str) -> tuple[Path, str]:
+def screenshot_tradingview(url: str, symbol: str, interval: str) -> tuple[Optional[Path], Optional[str], str, str]:
     filename = f"{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}.png"
     out_path = SCREENSHOT_DIR / filename
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        page = browser.new_page(viewport={"width": 1440, "height": 950}, device_scale_factor=1)
+    chart_status = "ok"
+    chart_note = "TradingView grafiği yüklendi ve screenshot alındı."
+    ctx = BROWSER.get_context()
+    page = None
+    try:
+        page = ctx.new_page()
+        page.set_default_timeout(18000)
+        page.set_default_navigation_timeout(90000)
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(8000)
-
-            # Olası pop-up/çerez/uyarı kapatmaları. Bulunmazsa sessiz geçer.
-            possible_close_selectors = [
-                "button[aria-label='Close']",
-                "button[aria-label='Kapat']",
-                "button[data-name='close']",
-                "button:has-text('Accept')",
-                "button:has-text('Kabul')",
-                "button:has-text('Tümünü kabul et')",
-            ]
-            for selector in possible_close_selectors:
-                try:
-                    page.locator(selector).first.click(timeout=700)
-                    page.wait_for_timeout(300)
-                except Exception:
-                    pass
-
-            page.screenshot(path=str(out_path), full_page=False, type="png")
+            page.goto(url, wait_until="domcontentloaded", timeout=90000)
         except PlaywrightTimeoutError:
-            raise HTTPException(status_code=504, detail="TradingView grafiği zamanında yüklenmedi.")
-        finally:
-            browser.close()
+            chart_status = "partial_timeout"
+            chart_note = "TradingView domcontentloaded timeout verdi; eldeki sayfa screenshotlandı."
+        page.wait_for_timeout(int(os.getenv("TV_INITIAL_WAIT_MS", "14000")))
+        click_soft_popups(page)
+        canvas_found = False
+        for selector in ["canvas", "div.chart-container", "div[data-name='legend-source-item']"]:
+            try:
+                page.locator(selector).first.wait_for(state="visible", timeout=10000)
+                canvas_found = True
+                break
+            except Exception:
+                pass
+        if not canvas_found and chart_status == "ok":
+            chart_status = "partial_no_canvas_detected"
+            chart_note = "TradingView açıldı ama canvas/legend doğrulanamadı; viewport screenshot alındı."
+        page.screenshot(path=str(out_path), full_page=False, type="png")
+        return out_path, f"/screenshots/{filename}", chart_status, chart_note
+    except Exception as e:
+        chart_status = "chart_failed_data_only"
+        chart_note = f"TradingView screenshot başarısız; veri katmanları yine döndürüldü. Hata: {type(e).__name__}: {e}"
+        try:
+            if page:
+                page.screenshot(path=str(out_path), full_page=False, type="png")
+                return out_path, f"/screenshots/{filename}", "partial_screenshot_recovered", chart_note
+        except Exception:
+            pass
+        BROWSER.reset()
+        return None, None, chart_status, chart_note
+    finally:
+        try:
+            if page:
+                page.close()
+        except Exception:
+            pass
 
-    return out_path, f"/screenshots/{filename}"
+def df_to_records(df: pd.DataFrame, limit: int = 80) -> list[dict]:
+    if df is None or df.empty:
+        return []
+    out = df.tail(limit).reset_index()
+    records = []
+    for _, row in out.iterrows():
+        rec = {}
+        for k, v in row.items():
+            key = str(k).lower().replace(" ", "_")
+            if hasattr(v, "isoformat"):
+                rec[key] = v.isoformat()
+            elif pd.isna(v):
+                rec[key] = None
+            elif isinstance(v, (int, float)):
+                rec[key] = round(float(v), 4)
+            else:
+                rec[key] = str(v)
+        records.append(rec)
+    return records
 
+def fetch_yahoo_ohlc(yahoo_symbol: str, interval: str, range_hint: str, target_date: Optional[str]) -> tuple[list[dict], str, str]:
+    yf_interval = YF_INTERVALS.get(interval, "5m")
+    period = range_hint if range_hint in YF_ALLOWED_PERIODS else "5d"
+    if target_date:
+        period = "3mo" if yf_interval != "1d" else "1y"
+    cache_key = f"yahoo:{yahoo_symbol}:{yf_interval}:{period}:{target_date or ''}"
+    cached = OHLC_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
+        return cached[1], "cache_yahoo", cached[4]
+    try:
+        df = yf.download(yahoo_symbol, period=period, interval=yf_interval, progress=False, auto_adjust=False, threads=False)
+        records = df_to_records(df, 120)
+        status = "ok_yahoo_intraday" if records and yf_interval != "1d" else ("ok_yahoo_daily" if records else "no_yahoo_data")
+        note = f"Yahoo Finance {yahoo_symbol} interval={yf_interval} period={period}."
+        OHLC_CACHE[cache_key] = (time.time(), records, status, "Yahoo Finance", note)
+        return records, status, note
+    except Exception as e:
+        note = f"Yahoo Finance hata: {type(e).__name__}: {e}"
+        OHLC_CACHE[cache_key] = (time.time(), [], "yahoo_error", "Yahoo Finance", note)
+        return [], "yahoo_error", note
 
+def fetch_stooq_daily(symbol: str) -> tuple[list[dict], str, str]:
+    cache_key = f"stooq:{symbol}"
+    cached = OHLC_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
+        return cached[1], "cache_stooq_daily", cached[4]
+    urls = [
+        f"https://stooq.com/q/d/l/?s={symbol.lower()}.tr&i=d",
+        f"https://stooq.com/q/d/l/?s={symbol.lower()}.is&i=d",
+    ]
+    last_error = ""
+    for url in urls:
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            r.raise_for_status()
+            if "Date," not in r.text:
+                last_error = "CSV beklenen formatta değil"
+                continue
+            from io import StringIO
+            df = pd.read_csv(StringIO(r.text))
+            records = df_to_records(df, 80)
+            if records:
+                note = f"Stooq günlük fallback kullanıldı: {url}"
+                OHLC_CACHE[cache_key] = (time.time(), records, "stooq_daily_fallback", "Stooq", note)
+                return records, "stooq_daily_fallback", note
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+    note = f"Stooq günlük fallback veri bulamadı. Son hata: {last_error}"
+    OHLC_CACHE[cache_key] = (time.time(), [], "no_stooq_data", "Stooq", note)
+    return [], "no_stooq_data", note
 
-def http_get_text(url: str, timeout: int = 12) -> tuple[str, str | None]:
+def http_get_text(url: str, timeout: int = 12) -> tuple[str, Optional[str]]:
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
         "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
@@ -154,380 +302,108 @@ def http_get_text(url: str, timeout: int = 12) -> tuple[str, str | None]:
     except Exception as e:
         return "", f"{type(e).__name__}: {e}"
 
-
-def tr_number_to_float(value: str):
-    if value is None:
-        return None
-    v = str(value).strip().replace("%", "").replace("+", "")
-    v = re.sub(r"[^0-9,.-]", "", v)
-    if not v:
-        return None
-    # TR format: 1.234.567,89 -> 1234567.89
-    if "," in v:
-        v = v.replace(".", "").replace(",", ".")
-    try:
-        return float(v)
-    except Exception:
-        return None
-
-
-def lines_from_html(html: str) -> list[str]:
+def extract_context_text(html: str, symbol: str) -> str:
     text = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
     text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
     text = re.sub(r"<[^>]+>", "\n", text)
-    text = re.sub(r"&nbsp;", " ", text)
-    text = re.sub(r"&amp;", "&", text)
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&")
     lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
-    return [x for x in lines if x]
+    hits = [x for x in lines if symbol.upper() in x.upper() or "BIST" in x.upper()]
+    joined = " | ".join(hits[:20])
+    return joined[:1200]
 
-
-def parse_symbol_block(lines: list[str], symbol: str) -> dict | None:
-    sym = normalize_symbol(symbol)
-    numeric_re = re.compile(r"^[+-]?\d{1,3}(?:\.\d{3})*(?:,\d+)?%?$|^[+-]?\d+(?:,\d+)?%?$")
-    for i, line in enumerate(lines):
-        tokens = line.upper().split()
-        # Tam sembol eşleşsin; şirket adında geçişlerden kaçınmak için ilk birkaç token yeterli.
-        if sym in tokens[:3] or line.upper() == sym:
-            nums = []
-            for nxt in lines[i + 1:i + 12]:
-                cleaned = nxt.replace("−", "-")
-                if numeric_re.match(cleaned):
-                    nums.append(cleaned)
-                if len(nums) >= 6:
-                    break
-            if nums:
-                out = {"symbol": sym, "raw_label": line, "raw_values": nums}
-                # Genel tablo sıralaması: son/alış/satış/fark%/düşük/yüksek/aof/hacim TL/hacim lot olabilir.
-                out["last"] = tr_number_to_float(nums[0])
-                if len(nums) > 1:
-                    out["change_or_bid"] = tr_number_to_float(nums[1])
-                if len(nums) > 2:
-                    out["change_percent_or_ask"] = tr_number_to_float(nums[2])
-                return out
-    return None
-
-
-def fetch_midas_quote(symbol: str) -> dict:
-    url = "https://www.getmidas.com/canli-borsa/"
-    html, err = http_get_text(url)
-    if err:
-        return {"provider": "Midas Canlı Borsa", "status": "error", "url": url, "note": err}
-    block = parse_symbol_block(lines_from_html(html), symbol)
-    if not block:
-        return {"provider": "Midas Canlı Borsa", "status": "not_found", "url": url, "note": "Sembol tabloda bulunamadı veya sayfa dinamik değişti."}
-    block.update({"provider": "Midas Canlı Borsa", "status": "ok", "url": url, "note": "Midas canlı borsa sayfası 15 dakika gecikmeli olabilir; son/alış/satış/düşük-yüksek/AOF/hacim alanları tabloda bulunursa raw_values içinde döner."})
-    return block
-
-
-def fetch_bloomberght_quote(symbol: str) -> dict:
-    url = "https://www.bloomberght.com/borsa"
-    html, err = http_get_text(url)
-    if err:
-        return {"provider": "BloombergHT Borsa", "status": "error", "url": url, "note": err}
-    block = parse_symbol_block(lines_from_html(html), symbol)
-    if not block:
-        return {"provider": "BloombergHT Borsa", "status": "not_found", "url": url, "note": "Sembol görünür borsa listelerinde bulunamadı; sayfa yalnızca öne çıkan/çok işlem görenleri gösterebilir."}
-    block.update({"provider": "BloombergHT Borsa", "status": "ok", "url": url, "note": "BloombergHT görünür borsa tablosundan özet fiyat teyidi."})
-    return block
-
-
-def fetch_investing_quote(symbol: str) -> dict:
-    url = "https://tr.investing.com/"
-    html, err = http_get_text(url)
-    if err:
-        return {"provider": "Investing.com TR", "status": "error", "url": url, "note": err}
-    block = parse_symbol_block(lines_from_html(html), symbol)
-    if not block:
-        return {"provider": "Investing.com TR", "status": "not_found", "url": url, "note": "Ana sayfada sembol bulunamadı; Investing sayfaları dinamik/korumalı olabilir. Yine de kaynak durumuna raporlandı."}
-    block.update({"provider": "Investing.com TR", "status": "ok", "url": url, "note": "Investing TR görünür piyasa listelerinden özet fiyat teyidi; grafik/intraday mum API değildir."})
-    return block
-
-
-def fetch_bist_reference(symbol: str) -> dict:
-    url = "https://www.borsaistanbul.com/"
-    html, err = http_get_text(url)
-    if err:
-        return {"provider": "Borsa İstanbul", "status": "error", "url": url, "note": err}
-    # Resmi site çoğunlukla canlı intraday OHLC tablosu değil; veri menülerinin erişilebilirliğini doğrular.
-    has_data_menu = ("Pay Piyasası Verileri" in html) or ("Günlük Bülten" in html) or ("Veriler" in html)
-    return {
-        "provider": "Borsa İstanbul",
-        "status": "reference_ok" if has_data_menu else "reference_limited",
-        "url": url,
-        "symbol": normalize_symbol(symbol),
-        "note": "Resmi Borsa İstanbul sitesi veri/duyuru/günlük bülten referansı olarak kullanılır; ücretsiz canlı 1dk/5dk mum verisi kaynağı gibi davranmaz. Intraday grafik için TradingView; özet fiyat için Midas/Investing/BloombergHT kullanılır."
+def fetch_public_quotes(symbol: str) -> tuple[list[dict], dict]:
+    cache_key = f"quotes:{symbol}"
+    cached = QUOTE_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < QUOTE_CACHE_TTL_SECONDS:
+        return cached[1], cached[2]
+    sources = [
+        ("Midas", f"https://www.getmidas.com/canli-borsa/{symbol.lower()}"),
+        ("Midas canlı borsa arama", "https://www.getmidas.com/canli-borsa/"),
+        ("BloombergHT", f"https://www.bloomberght.com/borsa/hisse/{symbol.lower()}"),
+        ("BloombergHT borsa", "https://www.bloomberght.com/borsa"),
+        ("Investing TR", f"https://tr.investing.com/search/?q={symbol}"),
+    ]
+    snapshots = []
+    for name, url in sources:
+        html, err = http_get_text(url)
+        entry = {"source": name, "url": url, "status": "ok" if html else "error", "note": None, "context": None}
+        if err:
+            entry["note"] = err
+        else:
+            entry["context"] = extract_context_text(html, symbol)
+            if name.startswith("Midas"):
+                entry["note"] = "Midas canlı borsa sayfası gecikmeli olabilir; fiyat teyidi için ek kaynak olarak kullanılır."
+        snapshots.append(entry)
+    official = {
+        "source": "Borsa Istanbul",
+        "status": "reference_only",
+        "url": "https://www.borsaistanbul.com/",
+        "note": "Resmi kaynak/duyuru/günlük bülten referansı. Ücretsiz canlı 1dk/5dk mum API kaynağı gibi kullanılmaz.",
     }
+    QUOTE_CACHE[cache_key] = (time.time(), snapshots, official)
+    return snapshots, official
 
-
-def fetch_public_quote_snapshots(symbol: str) -> tuple[list[dict], dict]:
-    quotes = []
-    for fn in (fetch_midas_quote, fetch_bloomberght_quote, fetch_investing_quote):
-        try:
-            quotes.append(fn(symbol))
-        except Exception as e:
-            quotes.append({"provider": fn.__name__, "status": "error", "note": f"{type(e).__name__}: {e}"})
-    try:
-        official = fetch_bist_reference(symbol)
-    except Exception as e:
-        official = {"provider": "Borsa İstanbul", "status": "error", "note": f"{type(e).__name__}: {e}"}
-    return quotes, official
-
-
-def flatten_yfinance_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [str(c[0]) for c in df.columns]
-    return df
-
-
-def clean_ohlc_df(df: pd.DataFrame, target_date: Optional[str], max_rows: int = 160) -> list[dict]:
-    if df is None or df.empty:
-        return []
-
-    df = flatten_yfinance_columns(df).copy()
-    df = df.dropna(how="all")
-
-    if target_date:
-        wanted = pd.to_datetime(target_date).date()
-        try:
-            idx_dates = pd.to_datetime(df.index).date
-            same_day = df.loc[idx_dates == wanted]
-            if not same_day.empty:
-                df = same_day
-        except Exception:
-            pass
-
-    if df.empty:
-        return []
-
-    df = df.reset_index().tail(max_rows)
-    rows = []
-    for _, r in df.iterrows():
-        dt_val = r.get("Datetime", r.get("Date", r.iloc[0] if len(r) else ""))
-        row = {
-            "time": str(dt_val),
-            "open": None if pd.isna(r.get("Open")) else round(float(r.get("Open")), 4),
-            "high": None if pd.isna(r.get("High")) else round(float(r.get("High")), 4),
-            "low": None if pd.isna(r.get("Low")) else round(float(r.get("Low")), 4),
-            "close": None if pd.isna(r.get("Close")) else round(float(r.get("Close")), 4),
-            "volume": None if pd.isna(r.get("Volume")) else int(float(r.get("Volume"))),
-        }
-        if any(row[k] is not None for k in ["open", "high", "low", "close", "volume"]):
-            rows.append(row)
-    return rows
-
-
-def read_cache(cache_key: str):
-    cached = OHLC_CACHE.get(cache_key)
-    if not cached:
-        return None
-    ts, rows, status, note, provider = cached
-    if time.time() - ts > CACHE_TTL_SECONDS:
-        OHLC_CACHE.pop(cache_key, None)
-        return None
-    return rows, status, note + " Cache kullanıldı; gereksiz Yahoo isteği yapılmadı.", provider
-
-
-def write_cache(cache_key: str, rows: list[dict], status: str, note: str, provider: str):
-    if rows:
-        OHLC_CACHE[cache_key] = (time.time(), rows, status, note, provider)
-
-
-def stooq_symbol(symbol: str) -> str:
-    # Stooq BIST günlük verilerinde genelde thyao.tr / asels.tr formatı kullanılır.
-    return f"{normalize_symbol(symbol).lower()}.tr"
-
-
-def fetch_stooq_daily(symbol: str, target_date: Optional[str], max_rows: int = 160) -> tuple[list[dict], str, str]:
-    base_note = (
-        "Stooq günlük OHLC fallback katmanı kullanıldı. "
-        "Bu kaynak intraday mum doğrulaması için değil, günlük açılış-yüksek-düşük-kapanış/hacim teyidi içindir."
-    )
-    url = f"https://stooq.com/q/d/l/?s={stooq_symbol(symbol)}&i=d"
-    try:
-        df = pd.read_csv(url)
-        if df is None or df.empty:
-            return [], "no_stooq_data", base_note + " Stooq veri döndürmedi."
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"])
-        if target_date:
-            wanted = pd.to_datetime(target_date).date()
-            same_day = df.loc[df["Date"].dt.date == wanted]
-            if not same_day.empty:
-                df = same_day
-            else:
-                # Belirtilen güne veri yoksa hedef tarih çevresindeki son kayıtları döndür.
-                df = df.loc[df["Date"].dt.date <= wanted].tail(max_rows)
-        else:
-            df = df.tail(max_rows)
-        rows = []
-        for _, r in df.iterrows():
-            row = {
-                "time": str(r.get("Date", "")),
-                "open": None if pd.isna(r.get("Open")) else round(float(r.get("Open")), 4),
-                "high": None if pd.isna(r.get("High")) else round(float(r.get("High")), 4),
-                "low": None if pd.isna(r.get("Low")) else round(float(r.get("Low")), 4),
-                "close": None if pd.isna(r.get("Close")) else round(float(r.get("Close")), 4),
-                "volume": None if pd.isna(r.get("Volume")) else int(float(r.get("Volume"))),
-            }
-            rows.append(row)
-        if rows:
-            return rows, "stooq_daily_fallback", base_note
-        return [], "no_stooq_data", base_note + " Stooq satırları temizlenemedi."
-    except Exception as e:
-        return [], "stooq_error", base_note + f" Stooq hatası: {type(e).__name__}: {e}"
-
-
-def yf_download_with_fallbacks(yf_symbol: str, yf_interval: str, period: str, target_date: Optional[str], plain_symbol: str) -> tuple[list[dict], str, str, str]:
-    cache_key = f"{yf_symbol}:{yf_interval}:{period}:{target_date or 'latest'}"
-    cached = read_cache(cache_key)
-    if cached:
-        return cached
-
-    base_note = (
-        "Yahoo Finance doğrulama/eksik veri tamamlama katmanı kullanıldı. "
-        "BIST intraday verileri ücretsiz kaynaklarda gecikmeli, sınırlı veya dönemsel olarak eksik olabilir. "
-        "Mikro yapı/derinlik/AKD/BOFA için aracı kurum ekranı gerekir."
-    )
-
-    attempts: list[dict] = []
-
-    if target_date:
-        try:
-            d = datetime.strptime(target_date, "%Y-%m-%d").date()
-        except ValueError:
-            raise HTTPException(status_code=400, detail="target_date YYYY-MM-DD formatında olmalı. Örn: 2026-06-04")
-
-        attempts.append({"mode": "download_date_intraday", "start": d - timedelta(days=4), "end": d + timedelta(days=4), "interval": yf_interval})
-        attempts.append({"mode": "download_date_daily", "start": d - timedelta(days=14), "end": d + timedelta(days=14), "interval": "1d"})
-    else:
-        safe_period = period if period in YF_ALLOWED_PERIODS else "5d"
-        attempts.append({"mode": "download_period", "period": safe_period, "interval": yf_interval})
-        if yf_interval != "1d":
-            attempts.append({"mode": "download_period_daily", "period": "3mo" if safe_period in {"1mo", "3mo", "6mo", "1y"} else "1mo", "interval": "1d"})
-
-    last_error = None
-
-    for attempt in attempts:
-        try:
-            if "period" in attempt:
-                df = yf.download(
-                    yf_symbol,
-                    period=attempt["period"],
-                    interval=attempt["interval"],
-                    progress=False,
-                    auto_adjust=False,
-                    threads=False,
-                )
-            else:
-                df = yf.download(
-                    yf_symbol,
-                    start=attempt["start"].isoformat(),
-                    end=attempt["end"].isoformat(),
-                    interval=attempt["interval"],
-                    progress=False,
-                    auto_adjust=False,
-                    threads=False,
-                )
-            rows = clean_ohlc_df(df, target_date=target_date)
-            if rows:
-                if attempt["interval"] != yf_interval:
-                    status = "partial_yahoo_daily_fallback"
-                    note = base_note + f" İstenen Yahoo intervali bulunamadı; fallback olarak {attempt['interval']} döndü."
-                    write_cache(cache_key, rows, status, note, "Yahoo Finance")
-                    return rows, status, note, "Yahoo Finance"
-                status = "ok"
-                note = base_note
-                write_cache(cache_key, rows, status, note, "Yahoo Finance")
-                return rows, status, note, "Yahoo Finance"
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {e}"
-            if "RateLimit" in type(e).__name__ or "Too Many Requests" in str(e):
-                break
-
-    try:
-        ticker = yf.Ticker(yf_symbol)
-        if target_date:
-            d = datetime.strptime(target_date, "%Y-%m-%d").date()
-            df = ticker.history(start=(d - timedelta(days=14)).isoformat(), end=(d + timedelta(days=14)).isoformat(), interval="1d", auto_adjust=False)
-        else:
-            df = ticker.history(period="1mo", interval=yf_interval, auto_adjust=False)
-        rows = clean_ohlc_df(df, target_date=target_date)
-        if rows:
-            status = "ok_ticker_history"
-            note = base_note + " Veri yfinance Ticker.history fallback yöntemiyle alındı."
-            write_cache(cache_key, rows, status, note, "Yahoo Finance")
-            return rows, status, note, "Yahoo Finance"
-    except Exception as e:
-        last_error = f"{type(e).__name__}: {e}"
-
-    stooq_rows, stooq_status, stooq_note = fetch_stooq_daily(plain_symbol, target_date=target_date)
-    if stooq_rows:
-        note = (
-            base_note
-            + " Yahoo Finance veri veremedi; eksik veri tamamlama için Stooq günlük OHLC fallback kullanıldı. "
-            + stooq_note
-        )
-        if last_error:
-            note += f" Yahoo son hata: {last_error}"
-        write_cache(cache_key, stooq_rows, stooq_status, note, "Stooq Daily")
-        return stooq_rows, stooq_status, note, "Stooq Daily"
-
-    msg = base_note + " Yahoo Finance veri bulunamadı. Sembol .IS formatıyla denendi. Stooq günlük fallback de veri döndüremedi."
-    if last_error:
-        msg += f" Son hata: {last_error}"
-    msg += " Grafik screenshot yine de TradingView'den alındı; görsel analiz yapılabilir fakat sayısal OHLC doğrulaması eksik işaretlenmelidir."
-    return [], "no_data_all_sources", msg, "none"
-
-def fetch_yahoo_ohlc(symbol: str, interval: str, period: str, target_date: Optional[str]) -> tuple[list[dict], str, str, str, str]:
-    yf_symbol = make_yahoo_symbol(symbol)
-    yf_interval = YF_INTERVALS.get(interval, "5m")
-    rows, status, note, provider = yf_download_with_fallbacks(yf_symbol, yf_interval, period, target_date, plain_symbol=symbol)
-    note = note + f" Veri sağlayıcı durumu: {provider}."
-    return rows, status, note, yf_symbol, yf_interval
-
+def build_ohlc(symbol: str, yahoo_symbol: str, interval: str, range_hint: str, target_date: Optional[str]):
+    records, status, note = fetch_yahoo_ohlc(yahoo_symbol, interval, range_hint, target_date)
+    if records:
+        return records, status, note
+    stooq_records, stooq_status, stooq_note = fetch_stooq_daily(symbol)
+    combined_note = f"{note} | {stooq_note}"
+    if stooq_records:
+        return stooq_records, stooq_status, combined_note
+    return [], "no_ohlc_all_sources", combined_note
 
 @app.get("/chart", response_model=ChartResponse)
-def get_chart(
+def chart(
     request: Request,
     symbol: str = Query(..., description="BIST sembolü. Örn: THYAO, ASELS, TUPRS"),
-    interval: Literal["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"] = Query("5m"),
-    range_hint: str = Query("5d", description="1d, 5d, 1mo, 3mo, 6mo, 1y gibi niyet bilgisi"),
-    target_date: Optional[str] = Query(None, description="YYYY-MM-DD. Örn: 2026-06-04"),
-    include_base64: bool = Query(False, description="true ise screenshot_base64_png de döner. Cevabı çok büyütür; normalde false kalsın."),
+    interval: str = Query("5m", description="1m, 3m, 5m, 10m, 15m, 30m, 1h, 1d"),
+    range_hint: str = Query("5d", description="Yahoo period ipucu: 1d, 5d, 1mo, 3mo, 6mo, 1y..."),
+    target_date: Optional[str] = Query(None, description="YYYY-MM-DD; tarihli analiz için doğrulama notu/veri aralığı."),
+    include_base64: bool = Query(False, description="true ise screenshot base64 döner; genelde false kalsın."),
 ):
-    s = normalize_symbol(symbol)
-    url = make_tv_url(s, interval)
-    image_path, image_route = screenshot_tradingview(url, symbol=s, interval=interval)
+    clean_symbol = normalize_symbol(symbol)
+    if interval not in TV_INTERVALS:
+        raise HTTPException(status_code=400, detail=f"Geçersiz interval: {interval}. Destek: {', '.join(TV_INTERVALS.keys())}")
+    if target_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", target_date):
+        raise HTTPException(status_code=400, detail="target_date YYYY-MM-DD formatında olmalı.")
+    yahoo_symbol = make_yahoo_symbol(clean_symbol)
+    tv_url = make_tv_url(clean_symbol, interval)
 
-    ohlc, status, note, yf_symbol, yf_interval = fetch_yahoo_ohlc(s, interval, range_hint, target_date)
-    quote_snapshots, official_reference = fetch_public_quote_snapshots(s)
-    ok_quote_providers = [q.get("provider") for q in quote_snapshots if q.get("status") == "ok"]
-    if ok_quote_providers:
-        note += " Ek ücretsiz fiyat teyit kaynakları başarılı: " + ", ".join(ok_quote_providers) + "."
-    else:
-        note += " Ek ücretsiz fiyat teyit kaynaklarından doğrudan sembol bazlı sonuç alınamadı; kaynak durumları quote_snapshots içinde raporlandı."
+    out_path, shot_path, chart_status, chart_note = screenshot_tradingview(tv_url, clean_symbol, interval)
+    records, data_status, data_note = build_ohlc(clean_symbol, yahoo_symbol, interval, range_hint, target_date)
+    quote_snapshots, official_reference = fetch_public_quotes(clean_symbol)
 
-    image_b64 = None
-    if include_base64:
-        image_b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+    screenshot_base64 = None
+    screenshot_url = absolute_url(request, shot_path) if shot_path else None
+    if include_base64 and out_path and out_path.exists():
+        screenshot_base64 = base64.b64encode(out_path.read_bytes()).decode("utf-8")
+
+    final_note = (
+        f"{chart_note} | {data_note} | Ücretsiz kaynaklarda BIST intraday verileri gecikmeli/sınırlı/eksik olabilir. "
+        "Mikro yapı, derinlik, AKD/BOFA ve karanlık oda için aracı kurum ekranı gerekir. "
+        "GPT analizi önce screenshot'ı, sonra OHLC ve public quote teyitlerini birlikte değerlendirmelidir."
+    )
 
     return ChartResponse(
-        symbol=s,
-        yahoo_symbol=yf_symbol,
+        symbol=clean_symbol,
+        yahoo_symbol=yahoo_symbol,
         interval=interval,
-        yahoo_interval_used=yf_interval,
+        yahoo_interval_used=YF_INTERVALS.get(interval, "5m"),
         range_hint=range_hint,
         target_date=target_date,
-        source_chart="TradingView visual chart screenshot",
-        source_data="Yahoo Finance OHLC + Stooq daily + Midas/Investing/BloombergHT quote verification + Borsa İstanbul official reference + in-memory cache",
-        tradingview_url=url,
-        screenshot_url=absolute_url(request, image_route),
-        screenshot_base64_png=image_b64,
-        ohlc_sample=ohlc,
-        ohlc_count=len(ohlc),
+        source_chart="TradingView visual chart screenshot via persistent Playwright browser",
+        source_data="Yahoo Finance OHLC + Stooq daily fallback + Midas/BloombergHT/Investing public quote checks + Borsa İstanbul official reference",
+        tradingview_url=tv_url,
+        screenshot_url=screenshot_url,
+        screenshot_base64_png=screenshot_base64,
+        chart_status=chart_status,
+        ohlc_sample=records,
+        ohlc_count=len(records),
         quote_snapshots=quote_snapshots,
         official_reference=official_reference,
-        data_status=status,
-        data_note=note,
+        data_status=data_status if records else ("public_quote_fallback" if quote_snapshots else data_status),
+        data_note=final_note,
         captured_at_utc=datetime.now(timezone.utc).isoformat(),
     )
