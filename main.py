@@ -19,15 +19,15 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.1.0-fullscreen-hover-last-candle"
+APP_VERSION = "5.0.0-snapshot-download-first"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
 QUOTE_CACHE_TTL_SECONDS = int(os.getenv("QUOTE_CACHE_TTL_SECONDS", "180"))
 TRADINGVIEW_COOKIE = os.getenv("TRADINGVIEW_COOKIE", "").strip()
 BROWSERLESS_WS_ENDPOINT = os.getenv("BROWSERLESS_WS_ENDPOINT", "").strip()
-TV_VIEWPORT_WIDTH = int(os.getenv("TV_VIEWPORT_WIDTH", "2200"))
-TV_VIEWPORT_HEIGHT = int(os.getenv("TV_VIEWPORT_HEIGHT", "1152"))
+TV_VIEWPORT_WIDTH = int(os.getenv("TV_VIEWPORT_WIDTH", "2400"))
+TV_VIEWPORT_HEIGHT = int(os.getenv("TV_VIEWPORT_HEIGHT", "1350"))
 TV_WAIT_CURRENT_MS = int(os.getenv("TV_WAIT_CURRENT_MS", "1200"))
 TV_WAIT_BALANCED_MS = int(os.getenv("TV_WAIT_BALANCED_MS", "9000"))
 TV_CANVAS_WAIT_CURRENT_MS = int(os.getenv("TV_CANVAS_WAIT_CURRENT_MS", "1200"))
@@ -49,13 +49,14 @@ SESSION_ZOOM_WHEEL_DELTA = int(os.getenv("SESSION_ZOOM_WHEEL_DELTA", "-620"))
 SESSION_ZOOM_X_RATIO = float(os.getenv("SESSION_ZOOM_X_RATIO", "0.74"))
 SESSION_ZOOM_Y_RATIO = float(os.getenv("SESSION_ZOOM_Y_RATIO", "0.58"))
 CHART_ONLY_SCREENSHOT = os.getenv("CHART_ONLY_SCREENSHOT", "true").lower() in {"1", "true", "yes", "on"}
-CHART_CLIP_WIDTH_RATIO = float(os.getenv("CHART_CLIP_WIDTH_RATIO", "0.78"))
-CHART_CLIP_HEIGHT_RATIO = float(os.getenv("CHART_CLIP_HEIGHT_RATIO", "0.985"))
+CHART_CLIP_WIDTH_RATIO = float(os.getenv("CHART_CLIP_WIDTH_RATIO", "1.00"))
+CHART_CLIP_HEIGHT_RATIO = float(os.getenv("CHART_CLIP_HEIGHT_RATIO", "1.00"))
 # For BIST current/session screenshots, crop out older sessions on the left so the latest trading day is wider.
 # 0.0 = no left crop. Typical values: 0.30-0.42. Default tuned from THYAO 5m tests.
-SESSION_LEFT_CROP_RATIO = float(os.getenv("SESSION_LEFT_CROP_RATIO", "0.36"))
+SESSION_LEFT_CROP_RATIO = float(os.getenv("SESSION_LEFT_CROP_RATIO", "0.00"))
 BIST_SESSION_START = os.getenv("BIST_SESSION_START", "09:55")
 BIST_SESSION_END = os.getenv("BIST_SESSION_END", "18:10")
+BIST_SESSION_STRICT_NOTE = "BIST 5m session target is 09:55-18:10. The system must not claim exact full-session coverage unless the x-axis visually shows that band."
 
 # TradingView UI adjustment: try to maximize graph area and place the crosshair just above
 # the latest candle column so TradingView's top legend/volume reflects the last candle.
@@ -63,8 +64,13 @@ TV_FORCE_FULLSCREEN = os.getenv("TV_FORCE_FULLSCREEN", "true").lower() in {"1", 
 TV_FULLSCREEN_SHORTCUT = os.getenv("TV_FULLSCREEN_SHORTCUT", "Shift+F")
 TV_HOVER_LAST_CANDLE = os.getenv("TV_HOVER_LAST_CANDLE", "true").lower() in {"1", "true", "yes", "on"}
 TV_CLICK_LAST_CANDLE_COLUMN = os.getenv("TV_CLICK_LAST_CANDLE_COLUMN", "true").lower() in {"1", "true", "yes", "on"}
-TV_LAST_CANDLE_X_RATIO = float(os.getenv("TV_LAST_CANDLE_X_RATIO", "0.955"))
-TV_LAST_CANDLE_Y_RATIO = float(os.getenv("TV_LAST_CANDLE_Y_RATIO", "0.52"))
+TV_LAST_CANDLE_X_RATIO = float(os.getenv("TV_LAST_CANDLE_X_RATIO", "0.965"))
+TV_LAST_CANDLE_Y_RATIO = float(os.getenv("TV_LAST_CANDLE_Y_RATIO", "0.38"))
+
+# v5 snapshot-first: try the chart provider's own exported image before raw viewport screenshot.
+TV_SNAPSHOT_DOWNLOAD_FIRST = os.getenv("TV_SNAPSHOT_DOWNLOAD_FIRST", "true").lower() in {"1", "true", "yes", "on"}
+TV_SNAPSHOT_TIMEOUT_MS = int(os.getenv("TV_SNAPSHOT_TIMEOUT_MS", "9000"))
+TV_SNAPSHOT_MENU_TIMEOUT_MS = int(os.getenv("TV_SNAPSHOT_MENU_TIMEOUT_MS", "2500"))
 
 TV_INTERVALS = {"1m": "1", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "1h": "60", "1d": "D"}
 YF_INTERVALS = {"1m": "1m", "3m": "5m", "5m": "5m", "10m": "15m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d"}
@@ -131,6 +137,7 @@ class BrowserManager:
 
             self._context = await self._browser.new_context(
                 viewport={"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT},
+                accept_downloads=True,
                 device_scale_factor=1,
                 locale="tr-TR",
                 timezone_id="Europe/Istanbul",
@@ -174,6 +181,8 @@ class ChartResponse(BaseModel):
     source_chart: str
     source_data: str
     tradingview_url: str
+    capture_method_used: str = "unknown"
+    download_attempt_note: str = ""
     screenshot_url: Optional[str] = None
     screenshot_base64_png: Optional[str] = Field(default=None, description="include_base64=true ise gelir; aksi halde null döner.")
     chart_status: str
@@ -188,7 +197,7 @@ class ChartResponse(BaseModel):
 
 app = FastAPI(
     title="BIST Chart GPT Action API",
-    description="ChatGPT Actions compatible BIST chart service: strict TradingView screenshot first; no loading screen or non-chart fallback is returned as chart.",
+    description="ChatGPT Actions compatible BIST chart service: TradingView snapshot/download first, strict screenshot fallback; no loading screen or non-chart fallback is returned as chart.",
     version=APP_VERSION,
 )
 app.mount("/screenshots", StaticFiles(directory=str(SCREENSHOT_DIR)), name="screenshots")
@@ -203,7 +212,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO}}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END, "strict_note": BIST_SESSION_STRICT_NOTE}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO}}
 
 @app.get("/warmup")
 async def warmup():
@@ -449,30 +458,40 @@ async def try_tradingview_fullscreen(page: Page):
         pass
 
 async def hover_latest_candle_column(page: Page):
-    """Move/click one tick above the latest visible candle column.
+    """Place the crosshair one tick above the latest visible candle column.
 
-    TradingView updates the top OHLC/volume legend from the crosshair position.
-    We click slightly above the final candle body rather than on the candle so the
-    candle/volume information is visible without accidentally selecting/drawing.
+    Important: the user wants the crosshair/legend to reflect the final candle,
+    but not by clicking directly on the candle body. We therefore try a small
+    cluster of points close to the right price area, slightly above the candle
+    body zone. This updates TradingView's top OHLC/volume legend while avoiding
+    accidental drawing/selection.
     """
     if not TV_HOVER_LAST_CANDLE:
         return
     try:
-        # Use the clipped chart width when chart-only screenshots are enabled, so the
-        # crosshair lands inside the captured area and not on the hidden sidebar.
         right_edge = max(900, int(TV_VIEWPORT_WIDTH * CHART_CLIP_WIDTH_RATIO)) if CHART_ONLY_SCREENSHOT else TV_VIEWPORT_WIDTH
         left_crop = int(right_edge * SESSION_LEFT_CROP_RATIO) if (CHART_ONLY_SCREENSHOT and SESSION_LEFT_CROP_RATIO > 0) else 0
         left_crop = max(0, min(left_crop, right_edge - 850)) if CHART_ONLY_SCREENSHOT else 0
         capture_width = max(800, right_edge - left_crop) if CHART_ONLY_SCREENSHOT else TV_VIEWPORT_WIDTH
-        x = int(left_crop + capture_width * TV_LAST_CANDLE_X_RATIO)
-        y = int(TV_VIEWPORT_HEIGHT * TV_LAST_CANDLE_Y_RATIO)
-        await page.mouse.move(x, y)
+
+        # Primary point: near the final visible candle column, above the body.
+        base_x = int(left_crop + capture_width * TV_LAST_CANDLE_X_RATIO)
+        base_y = int(TV_VIEWPORT_HEIGHT * TV_LAST_CANDLE_Y_RATIO)
+        # Try a tiny horizontal cluster because TradingView may leave right-side future whitespace.
+        candidate_xs = [base_x, int(left_crop + capture_width * 0.945), int(left_crop + capture_width * 0.925)]
+        candidate_y = base_y
+        for x in candidate_xs:
+            x = max(left_crop + 50, min(x, left_crop + capture_width - 80))
+            await page.mouse.move(x, candidate_y)
+            await page.wait_for_timeout(180)
+            if TV_CLICK_LAST_CANDLE_COLUMN:
+                await page.mouse.click(x, candidate_y)
+                await page.wait_for_timeout(220)
+            await page.mouse.move(x, candidate_y)
+            await page.wait_for_timeout(180)
+        # Finish on the primary point.
+        await page.mouse.move(max(left_crop + 50, min(base_x, left_crop + capture_width - 80)), candidate_y)
         await page.wait_for_timeout(350)
-        if TV_CLICK_LAST_CANDLE_COLUMN:
-            await page.mouse.click(x, y)
-            await page.wait_for_timeout(450)
-        await page.mouse.move(x, y)
-        await page.wait_for_timeout(450)
     except Exception:
         pass
 
@@ -542,11 +561,112 @@ def screenshot_has_chart_content(path: Path) -> bool:
         # If validation itself fails, be conservative and do not trust the image.
         return False
 
+async def try_tradingview_download_image(page: Page, out_path: Path) -> tuple[bool, str]:
+    """Try TradingView's own snapshot/download-image UI.
+
+    This is preferred over a raw viewport screenshot because TradingView exports the
+    chart canvas as a clean image when the UI supports it. It is best-effort: if
+    the menu labels change or Browserless cannot stream the download, we fall back
+    to strict viewport screenshot validation.
+    """
+    if not TV_SNAPSHOT_DOWNLOAD_FIRST:
+        return False, "snapshot_download_disabled"
+
+    camera_selectors = [
+        "button[data-name='take-snapshot']",
+        "[data-name='take-snapshot']",
+        "button[data-name='snapshot-button']",
+        "[data-name='snapshot-button']",
+        "button[data-name='header-toolbar-screenshot']",
+        "[data-name='header-toolbar-screenshot']",
+        "button[aria-label*='snapshot' i]",
+        "button[aria-label*='camera' i]",
+        "button[aria-label*='Screenshot' i]",
+        "button[aria-label*='Foto' i]",
+        "button[aria-label*='Goruntu' i]",
+        "button[aria-label*='Görüntü' i]",
+    ]
+    download_texts = [
+        "Download image", "Download chart image", "Save image", "Save chart image",
+        "Goruntuyu indir", "Görüntüyü indir", "Resmi indir", "Grafiği indir", "Grafik indir",
+        "PNG", "JPG", "JPEG",
+    ]
+    notes = []
+
+    try:
+        # Close old menus/popups if any.
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(250)
+        except Exception:
+            pass
+
+        clicked_camera = False
+        for sel in camera_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.is_visible(timeout=TV_SNAPSHOT_MENU_TIMEOUT_MS):
+                    await loc.click(timeout=TV_SNAPSHOT_MENU_TIMEOUT_MS)
+                    await page.wait_for_timeout(600)
+                    clicked_camera = True
+                    notes.append(f"camera_selector={sel}")
+                    break
+            except Exception as e:
+                notes.append(f"camera_fail={sel}:{type(e).__name__}")
+
+        if not clicked_camera:
+            # Some TradingView builds expose the snapshot button only via the camera icon title or toolbar.
+            # Try a last-resort click near the top-right toolbar area, not over the chart body.
+            try:
+                await page.mouse.click(int(TV_VIEWPORT_WIDTH * 0.885), int(TV_VIEWPORT_HEIGHT * 0.035))
+                await page.wait_for_timeout(700)
+                notes.append("camera_fallback_top_right_click")
+                clicked_camera = True
+            except Exception as e:
+                return False, "snapshot camera not found: " + type(e).__name__
+
+        # Prefer an actual browser download if TradingView exposes one.
+        for text in download_texts:
+            try:
+                item = page.get_by_text(text, exact=False).first
+                if await item.is_visible(timeout=TV_SNAPSHOT_MENU_TIMEOUT_MS):
+                    async with page.expect_download(timeout=TV_SNAPSHOT_TIMEOUT_MS) as dl_info:
+                        await item.click(timeout=TV_SNAPSHOT_MENU_TIMEOUT_MS)
+                    download = await dl_info.value
+                    await download.save_as(str(out_path))
+                    if out_path.exists() and screenshot_has_chart_content(out_path):
+                        return True, "tradingview_download_image_ok; " + "; ".join(notes + [f"download_text={text}"])
+                    return False, "downloaded image failed visual validation; " + "; ".join(notes + [f"download_text={text}"])
+            except Exception as e:
+                notes.append(f"download_text_fail={text}:{type(e).__name__}")
+
+        # If the camera menu opens a new image/share page instead of direct download, try to capture that image.
+        # We do not accept it blindly: it must pass the same visual chart-content check.
+        pages_before = set(page.context.pages)
+        try:
+            await page.wait_for_timeout(1200)
+            new_pages = [pg for pg in page.context.pages if pg not in pages_before]
+            for np in new_pages:
+                try:
+                    await np.wait_for_load_state("domcontentloaded", timeout=4000)
+                    await np.screenshot(path=str(out_path), full_page=False, type="jpeg", quality=86, timeout=6000)
+                    if out_path.exists() and screenshot_has_chart_content(out_path):
+                        await np.close()
+                        return True, "tradingview_snapshot_new_page_captured; " + "; ".join(notes)
+                    await np.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return False, "snapshot/download UI tried but no valid image download captured; " + "; ".join(notes[-8:])
+    except Exception as e:
+        return False, f"snapshot download failed: {type(e).__name__}: {e}"
+
 async def capture_and_validate(page: Page, out_path: Path, img_type: str, quality: int) -> bool:
-    # Chart-only screenshot: crop out the TradingView right watchlist/details sidebar.
-    # The numeric price scale remains visible on the right edge of the chart pane, but
-    # the watchlist/symbol-info panel is excluded. Those details are returned separately
-    # from Midas/BloombergHT quote snapshots, so GPT focuses on the candles.
+    # Wide chart screenshot. Default v4.2 does NOT square-crop or left-crop; it keeps a landscape
+    # full chart canvas so candle proportions stay natural. CHART_CLIP_WIDTH_RATIO /
+    # SESSION_LEFT_CROP_RATIO remain tunable env knobs, but defaults preserve full width.
     clip = None
     if CHART_ONLY_SCREENSHOT:
         # First remove the right TradingView sidebar, then crop a tunable part of the
@@ -605,6 +725,19 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
                     # Do not keep this screenshot/candidate; continue to next TradingView path.
                     break
                 await hover_latest_candle_column(page)
+
+                # v5: Prefer TradingView's own exported image/snapshot when available.
+                # If it fails, fall back to strict viewport screenshot validation.
+                download_ok, download_note = await try_tradingview_download_image(page, out_path)
+                if download_ok:
+                    tv_error, tv_error_note = await page_has_tradingview_symbol_error(page)
+                    if tv_error:
+                        last_validation_note = f"attempt {attempt}: downloaded snapshot rejected after screenshot: {tv_error_note}"
+                        break
+                    status = "ok_download_image" if canvas_found else "ok_download_image_visual_verified"
+                    note = f"TradingView own download/snapshot image captured and visual content check passed. {download_note}"
+                    return out_path, f"/screenshots/{filename}", status, note
+
                 verified_image = await capture_and_validate(page, out_path, img_type, 78 if img_type == "jpeg" else 0)
                 if verified_image:
                     # Re-check after screenshot; some widgets show an error modal after canvas boot.
@@ -971,7 +1104,7 @@ def fetch_public_quotes(symbol: str, mode: str = "balanced") -> tuple[list[dict]
 
 def build_ohlc(symbol: str, yahoo_symbol: str, interval: str, range_hint: str, target_date: Optional[str], mode: str = "balanced") :
     if mode in {"current", "safe_current"} and not target_date:
-        return [], "current_quote_only", f"BIST session target: {BIST_SESSION_START}-{BIST_SESSION_END}. Current mode: speed-first current chart; slow Yahoo/Stooq OHLC calls skipped. Price verification uses public quote layers."
+        return [], "current_quote_only", f"BIST session target: {BIST_SESSION_START}-{BIST_SESSION_END}. Current mode: speed-first current chart; slow Yahoo/Stooq OHLC calls skipped. Price verification uses public quote layers. BIST session target is 09:55-18:10; do not claim exact full-day coverage unless the screenshot x-axis visually confirms this band. Last-candle crosshair target is enabled above the final candle column."
     records, status, note = fetch_yahoo_ohlc(yahoo_symbol, interval, range_hint, target_date)
     if records:
         return records, status, note
@@ -1076,9 +1209,11 @@ async def chart(
         yahoo_interval_used=YF_INTERVALS.get(interval, "5m"),
         range_hint=range_hint,
         target_date=target_date,
-        source_chart="TradingView visual chart screenshot via Browserless remote browser if configured, otherwise local Playwright; chart-only capture can force TradingView fullscreen and place the crosshair just above the latest candle so top legend/volume values are visible",
+        source_chart="TradingView chart image via Browserless remote browser; v5 tries TradingView own download/snapshot first, then strict viewport screenshot fallback",
         source_data="Strict TradingView image-first capture with session-tight-fit chart-only capture; Midas/BloombergHT provide external market info; no non-chart visual fallback; quotes are secondary and non-blocking",
         tradingview_url=tv_url,
+        capture_method_used=("tradingview_download_image" if "download_image" in chart_status or "snapshot" in chart_note.lower() else ("browser_viewport_screenshot" if shot_path else "none")),
+        download_attempt_note=(chart_note if ("download_image" in chart_status or "snapshot" in chart_note.lower()) else "download-first attempted when enabled; viewport screenshot fallback may have been used"),
         screenshot_url=screenshot_url,
         screenshot_base64_png=screenshot_base64,
         chart_status=chart_status,

@@ -1,21 +1,20 @@
-# BIST Chart GPT Action v4.0
+# BIST Chart GPT Action v5.0 - Snapshot Download First
 
-Strict TradingView chart capture with BIST session target + TradingView fullscreen/last-candle hover 09:55-18:10.
+Bu surum TradingView grafik goruntusunu almadan once sitenin kendi snapshot/download-image akisini dener. Basarisiz olursa strict viewport screenshot fallback kullanir.
 
-Key env vars:
-- BROWSERLESS_WS_ENDPOINT: Browserless WebSocket endpoint
-- PORT=10000
-- BIST_SESSION_START=09:55
-- BIST_SESSION_END=18:10
-- SESSION_LEFT_CROP_RATIO=0.36 (tune 0.28-0.42)
+## Env
+- `BROWSERLESS_WS_ENDPOINT`: Browserless WebSocket endpoint. Secret olarak ekle.
+- `PORT=10000`
+- `PYTHONUNBUFFERED=1`
+- `TV_SNAPSHOT_DOWNLOAD_FIRST=true` varsayilan.
+- `TV_SNAPSHOT_TIMEOUT_MS=9000`
 
-Endpoints:
-- /health
-- /warmup
-- /chart?symbol=THYAO&interval=5m&mode=current&view=session
+## Test
+- `/health`
+- `/warmup`
+- `/chart?symbol=THYAO&interval=5m&mode=current&view=session`
 
-
-## v4.1 additions
-- Attempts TradingView fullscreen/expanded chart before capture.
-- Moves/clicks the crosshair just above the latest candle column so the top OHLC/volume legend reflects that candle.
-- Configurable env: TV_FORCE_FULLSCREEN, TV_HOVER_LAST_CANDLE, TV_CLICK_LAST_CANDLE_COLUMN, TV_LAST_CANDLE_X_RATIO, TV_LAST_CANDLE_Y_RATIO.
+JSON'da `capture_method_used` alanini kontrol et:
+- `tradingview_download_image`: sitenin kendi export/snapshot yolu calisti.
+- `browser_viewport_screenshot`: export olmadi, strict screenshot fallback calisti.
+- `none`: dogrulanmis grafik yok, analiz yapma.

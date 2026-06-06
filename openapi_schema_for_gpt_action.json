@@ -1,142 +1,39 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "BIST Chart GPT Action API v3.5 Session Full-Day",
-    "version": "3.5.0"
+    "title": "BIST Chart GPT Action v5 Snapshot First",
+    "description": "BIST hisseleri icin TradingView grafik gorselini alir. Once sitenin kendi snapshot/download image akislarini dener; olmazsa strict viewport screenshot fallback kullanir. Loading, bos ekran ve sembol hata ekranlarini grafik diye dondurmez.",
+    "version": "5.0.0"
   },
   "servers": [
-    {
-      "url": "https://bist-chart-gpt-action.onrender.com"
-    }
+    {"url": "https://bist-chart-gpt-action.onrender.com"}
   ],
   "paths": {
     "/health": {
-      "get": {
-        "operationId": "health",
-        "responses": {
-          "200": {
-            "description": "OK"
-          }
-        }
-      }
+      "get": {"operationId": "health", "summary": "Servis durumunu kontrol et", "responses": {"200": {"description": "OK"}}}
     },
     "/warmup": {
-      "get": {
-        "operationId": "warmup",
-        "responses": {
-          "200": {
-            "description": "Browser warmup"
-          }
-        }
-      }
+      "get": {"operationId": "warmup", "summary": "Remote/local browser context hazirla", "responses": {"200": {"description": "Browser warmed"}}}
     },
     "/chart": {
       "get": {
         "operationId": "getBistChart",
+        "summary": "BIST hissesi icin 5dk mum grafik gorseli al",
+        "description": "TradingView grafiğini snapshot/download-first yontemiyle alir. Gorsel dogrulanmazsa screenshot_url null gelir; bu durumda grafik analizi yapilmaz.",
         "parameters": [
-          {
-            "name": "symbol",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string"
-            },
-            "description": "BIST symbol, e.g. THYAO, ASELS"
-          },
-          {
-            "name": "interval",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "5m",
-              "enum": [
-                "1m",
-                "3m",
-                "5m",
-                "10m",
-                "15m",
-                "30m",
-                "1h",
-                "1d"
-              ]
-            }
-          },
-          {
-            "name": "mode",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "current",
-              "enum": [
-                "current",
-                "safe_current",
-                "balanced",
-                "fast"
-              ]
-            },
-            "description": "current for latest full-day visual, safe_current for more patient current capture, balanced for dated/range requests."
-          },
-          {
-            "name": "range_hint",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "5d"
-            }
-          },
-          {
-            "name": "target_date",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            },
-            "description": "YYYY-MM-DD. For a dated request, use mode=balanced&view=session. TradingView date navigation is best-effort; OHLC layer is used for date verification."
-          },
-          {
-            "name": "include_base64",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false
-            }
-          },
-          {
-            "name": "auto_clear",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": true
-            }
-          },
-          {
-            "name": "view",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "session",
-              "enum": [
-                "session",
-                "full_day",
-                "day",
-                "auto"
-              ]
-            },
-            "description": "session/full_day/day fits the latest BIST session open-to-close from open to close on the screenshot. auto uses older behavior."
-          }
+          {"name": "symbol", "in": "query", "required": true, "schema": {"type": "string"}, "description": "BIST sembolu: THYAO, ASELS, TUPRS"},
+          {"name": "interval", "in": "query", "required": false, "schema": {"type": "string", "default": "5m", "enum": ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"]}, "description": "Mum araligi. Gun ici ana kural 5m."},
+          {"name": "mode", "in": "query", "required": false, "schema": {"type": "string", "default": "current", "enum": ["current", "safe_current", "balanced", "fast"]}, "description": "current guncel grafik; safe_current daha sabirli guncel grafik; balanced tarihsel/OHLC detay."},
+          {"name": "view", "in": "query", "required": false, "schema": {"type": "string", "default": "session", "enum": ["session", "full_day", "day", "auto"]}, "description": "session BIST 09:55-18:10 hedefli gorunum."},
+          {"name": "target_date", "in": "query", "required": false, "schema": {"type": "string"}, "description": "YYYY-MM-DD. Gecmis gun icin best-effort hedef tarih."},
+          {"name": "range_hint", "in": "query", "required": false, "schema": {"type": "string", "default": "5d"}, "description": "OHLC teyidi icin periyot ipucu."},
+          {"name": "include_base64", "in": "query", "required": false, "schema": {"type": "boolean", "default": false}},
+          {"name": "auto_clear", "in": "query", "required": false, "schema": {"type": "boolean", "default": true}}
         ],
-        "responses": {
-          "200": {
-            "description": "Strict TradingView session/full-day chart response"
-          }
-        }
+        "responses": {"200": {"description": "Chart response JSON"}, "400": {"description": "Bad request"}, "500": {"description": "Server error"}}
       }
-    }
+    },
+    "/screenshots-list": {"get": {"operationId": "screenshotsList", "responses": {"200": {"description": "List screenshots"}}}},
+    "/screenshots-clear": {"post": {"operationId": "screenshotsClear", "responses": {"200": {"description": "Clear screenshots"}}}}
   }
 }
