@@ -26,7 +26,7 @@ https://SENIN-URL.onrender.com/health
 Beklenen sürüm:
 
 ```json
-{"version":"1.5.0-final-resilient-gpt-action"}
+{"version":"1.6.0-source-url-encoding-fix"}
 ```
 
 ## Warmup

@@ -1,4 +1,5 @@
 import base64
+import html as html_lib
 import os
 import re
 import time
@@ -16,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from playwright.sync_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "1.5.0-final-resilient-gpt-action"
+APP_VERSION = "1.6.0-source-url-encoding-fix"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -26,6 +27,28 @@ TRADINGVIEW_COOKIE = os.getenv("TRADINGVIEW_COOKIE", "").strip()
 TV_INTERVALS = {"1m": "1", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "1h": "60", "1d": "D"}
 YF_INTERVALS = {"1m": "1m", "3m": "5m", "5m": "5m", "10m": "15m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d"}
 YF_ALLOWED_PERIODS = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"}
+
+BLOOMBERGHT_SLUGS = {
+    "THYAO": "thyao-turk-hava-yollari-detay",
+    "TUPRS": "tuprs-tupras-detay",
+    "ASELS": "asels-aselsan-detay",
+    "AKBNK": "akbnk-akbank-detay",
+    "TCELL": "tcell-turkcell-detay",
+    "TAVHL": "tavhl-tav-havalimanlari-detay",
+    "HLGYO": "hlgyo-halk-gmyo-detay",
+    "SELVA": "selva-selva-gida-detay",
+    "A1YEN": "a1yen-a1-yenilenebilir-enerji-detay",
+}
+
+INVESTING_SLUGS = {
+    "THYAO": "turk-hava-yollari",
+    "TUPRS": "tupras",
+    "ASELS": "aselsan",
+    "AKBNK": "akbank",
+    "TCELL": "turkcell",
+    "TAVHL": "tav-havalimanlari",
+}
+
 
 OHLC_CACHE: dict[str, tuple[float, list[dict], str, str, str]] = {}
 QUOTE_CACHE: dict[str, tuple[float, list[dict], dict]] = {}
@@ -298,34 +321,50 @@ def http_get_text(url: str, timeout: int = 12) -> tuple[str, Optional[str]]:
     try:
         r = requests.get(url, headers=headers, timeout=timeout)
         r.raise_for_status()
+        # Some Turkish pages omit/lie about encoding; apparent_encoding prevents mojibake like ÄŸ/ÅŸ.
+        if r.encoding is None or r.encoding.lower() in {"iso-8859-1", "latin-1"}:
+            r.encoding = r.apparent_encoding or "utf-8"
         return r.text, None
     except Exception as e:
         return "", f"{type(e).__name__}: {e}"
 
-def extract_context_text(html: str, symbol: str) -> str:
+def clean_html_text(html: str) -> list[str]:
     text = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
     text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
     text = re.sub(r"<[^>]+>", "\n", text)
-    text = text.replace("&nbsp;", " ").replace("&amp;", "&")
+    text = html_lib.unescape(text)
     lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
-    hits = [x for x in lines if symbol.upper() in x.upper() or "BIST" in x.upper()]
-    joined = " | ".join(hits[:20])
-    return joined[:1200]
+    return [x for x in lines if x]
+
+def extract_context_text(html: str, symbol: str) -> str:
+    lines = clean_html_text(html)
+    hits = [x for x in lines if symbol.upper() in x.upper() or "BIST" in x.upper() or "ALIŞ" in x.upper() or "SATIŞ" in x.upper() or "HACİM" in x.upper()]
+    joined = " | ".join(hits[:28])
+    return joined[:1600]
+
+def make_quote_sources(symbol: str) -> list[tuple[str, str]]:
+    midas_symbol = symbol.lower()
+    sources = [
+        ("Midas direct", f"https://www.getmidas.com/canli-borsa/{midas_symbol}-hisse/"),
+        ("Midas live table", "https://www.getmidas.com/canli-borsa/"),
+    ]
+    bloom_slug = BLOOMBERGHT_SLUGS.get(symbol.upper())
+    if bloom_slug:
+        sources.append(("BloombergHT direct", f"https://www.bloomberght.com/borsa/hisse/{bloom_slug}"))
+    sources.append(("BloombergHT borsa", "https://www.bloomberght.com/borsa"))
+    inv_slug = INVESTING_SLUGS.get(symbol.upper())
+    if inv_slug:
+        sources.append(("Investing direct", f"https://tr.investing.com/equities/{inv_slug}"))
+    sources.append(("Investing search", f"https://tr.investing.com/search/?q={symbol}"))
+    return sources
 
 def fetch_public_quotes(symbol: str) -> tuple[list[dict], dict]:
     cache_key = f"quotes:{symbol}"
     cached = QUOTE_CACHE.get(cache_key)
     if cached and time.time() - cached[0] < QUOTE_CACHE_TTL_SECONDS:
         return cached[1], cached[2]
-    sources = [
-        ("Midas", f"https://www.getmidas.com/canli-borsa/{symbol.lower()}"),
-        ("Midas canlı borsa arama", "https://www.getmidas.com/canli-borsa/"),
-        ("BloombergHT", f"https://www.bloomberght.com/borsa/hisse/{symbol.lower()}"),
-        ("BloombergHT borsa", "https://www.bloomberght.com/borsa"),
-        ("Investing TR", f"https://tr.investing.com/search/?q={symbol}"),
-    ]
     snapshots = []
-    for name, url in sources:
+    for name, url in make_quote_sources(symbol):
         html, err = http_get_text(url)
         entry = {"source": name, "url": url, "status": "ok" if html else "error", "note": None, "context": None}
         if err:
@@ -333,7 +372,11 @@ def fetch_public_quotes(symbol: str) -> tuple[list[dict], dict]:
         else:
             entry["context"] = extract_context_text(html, symbol)
             if name.startswith("Midas"):
-                entry["note"] = "Midas canlı borsa sayfası gecikmeli olabilir; fiyat teyidi için ek kaynak olarak kullanılır."
+                entry["note"] = "Midas canlı borsa sayfası BIST kaynaklı en az 15 dakika gecikmeli olabilir; ek fiyat teyidi olarak kullanılır."
+            if name.startswith("BloombergHT"):
+                entry["note"] = "BloombergHT sayfası fiyat/yüzde/hacim teyidi için ek kaynak olarak kullanılır."
+            if name.startswith("Investing"):
+                entry["note"] = "Investing sayfası fiyat/yüzde ve haber bağlamı için ek kaynak olarak kullanılır."
         snapshots.append(entry)
     official = {
         "source": "Borsa Istanbul",
