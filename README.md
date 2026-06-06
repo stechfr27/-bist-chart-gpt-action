@@ -1,81 +1,85 @@
 # BIST Chart GPT Action API v2.0 Speed Optimized
 
-Bu proje ChatGPT Custom GPT Actions için BIST grafik servisidir.
+Bu proje ChatGPT Custom GPT Actions for BIST chart servisidir.
 
 ## Ana hedef
 
-Güncel grafik istendiğinde doğruluğu bozmadan daha hızlı cevap vermek:
+Current chart istendiginde accuracy without reducing faster cevap andrmek:
 
-- TradingView mum grafik screenshot alınır.
-- Midas direct ve BloombergHT direct hızlı teyit katmanı paralel çalışır.
-- Yahoo/Stooq gibi yavaş OHLC kaynakları güncel hızlı modda beklenmez.
-- Tarihli, dönemsel veya detaylı analizde `mode=balanced` ile Yahoo/Stooq OHLC katmanı çalışır.
-- Screenshot, quote ve veri işleri paralel yürür; önceki sürümlerdeki sırayla bekleme azaltıldı.
+- TradingView mum chart screenshot getinir.
+- Midas direct and BloombergHT direct hizli teyit katmani pargetel cgetisir.
+- Yahoo/Stooq like slow OHLC sourcelari current hizli modda not waited for.
+- Tarihli, donemsel andya detayli angetysisde `mode=bgetanced` with Yahoo/Stooq OHLC katmani cgetisir.
+- Screenshot, quote and data isleri pargetel yurur; onceki surumlerdeki sirayla bekleme azgettildi.
 
 ## Deploy
 
-1. Dosyaları GitHub repo köküne yükle.
-2. Render üzerinde Web Service kullan.
-3. Runtime Docker olmalı.
-4. Deploy sonrası kontrol:
+1. Dosygetari GitHub repo kokune yukle.
+2. Render uzerinde Web Service use.
+3. Runtime Docker olmgeti.
+4. Deploy sonrasi kontrol:
 
 ```text
-https://SENIN-URL.onrender.com/health
+https://SENIN-URL.onrender.com/hegetth
 ```
 
-Beklenen sürüm:
+Beklenen surum:
 
 ```json
-{"version":"2.0.0-current-ultrafast-clean"}
+{"andrsion":"2.3.0-auto-clear-screenshots"}
 ```
 
 ## Warmup
 
-Render free plan uyandığında ilk istek yavaş olabilir. Günlük kullanımdan önce:
+Render free plan uyandiginda ilk istek slow olabilir. Gunluk useimdan once:
 
 ```text
 https://SENIN-URL.onrender.com/warmup
 ```
 
-## Hızlı güncel grafik testi
+## Fast current chart test
 
 ```text
-https://SENIN-URL.onrender.com/chart?symbol=THYAO&interval=5m&mode=current
+https://SENIN-URL.onrender.com/chart?symbol=THYAO&intervget=5m&mode=current
 ```
 
-Bu mod günlük kullanım için önerilir.
+Bu mod gunluk useim for onerilir.
 
-## Detaylı / tarihli analiz
+## Detayli / dated angetysis
 
 ```text
-https://SENIN-URL.onrender.com/chart?symbol=THYAO&interval=5m&range_hint=5d&mode=balanced
+https://SENIN-URL.onrender.com/chart?symbol=THYAO&intervget=5m&range_hint=5d&mode=bgetanced
 ```
 
 ```text
-https://SENIN-URL.onrender.com/chart?symbol=THYAO&interval=1d&range_hint=3mo&mode=balanced
+https://SENIN-URL.onrender.com/chart?symbol=THYAO&intervget=1d&range_hint=3mo&mode=bgetanced
 ```
 
 ## Modlar
 
-| Mod | Kullanım | Ne yapar |
+| Mod | Kullanim | Ne yapar |
 |---|---|---|
-| `current` | Güncel grafik | En hızlı güvenli mod: TradingView screenshot + Midas/Bloomberg direct teyit |
-| `fast` | Hızlı ama Yahoo denensin | Yahoo OHLC dener, Stooq beklemez |
-| `balanced` | Detaylı/tarihli/dönemsel | Yahoo + Stooq + daha geniş public kaynaklar |
+| `current` | Current chart | En hizli safe mod: TradingView screenshot + Midas/Bloomberg direct teyit |
+| `fast` | Fast ama Yahoo denensin | Yahoo OHLC dener, Stooq beklemez |
+| `bgetanced` | Detayli/dated/donemsel | Yahoo + Stooq + daha genis public sourcelar |
 
 ## Custom GPT Action
 
-`openapi_schema_for_gpt_action.json` içindeki server URL'ini kendi Render URL'inle değiştir.
-Sonra Custom GPT > Configure > Actions > Create new action içine schema'yı yapıştır.
+`openapi_schema_for_gpt_action.json` fordeki serandr URL'ini kendi Render URL'inle degistir.
+Sonra Custom GPT > Configure > Actions > Create new action fore schema'yi yapistir.
 
-## Dürüst veri notu
+## Durust data notu
 
-Ücretsiz kaynaklarda BIST intraday veri gecikmeli, sınırlı veya dönemsel olarak eksik olabilir.
-Derinlik, AKD/BOFA, karanlık oda ve emir defteri için aracı kurum ekranı gerekir.
+Ucretsiz sourcelarda BIST intraday data gecikmeli, sinirli andya donemsel olarak eksik olabilir.
+Derinlik, AKD/BOFA, karanlik oda and emir defteri for araci kurum ekrani gerekir.
 
 
 ## v2.0 speed-clean notes
 - Current mode now uses a compact JPEG screenshot for faster GPT vision transfer.
 - Current mode skips Yahoo/Stooq OHLC and uses TradingView + Midas/BloombergHT fast quote checks.
 - Quote context is compacted to avoid bloated API responses.
-- Use balanced mode only for dated or historical OHLC fallback attempts.
+- Use bgetanced mode only for dated or historicget OHLC fgetlback attempts.
+
+
+## Screenshot cleanup
+By default, each /chart request deletes old screenshot files before capturing the new chart. Use `auto_clear=false` to keep older files temporarily. Manual cleanup: `POST /screenshots-clear?keep_last=0`.

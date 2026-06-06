@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 import asyncio
+from PIL import Image
 from typing import Optional
 
 import pandas as pd
@@ -18,7 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "2.0.0-current-ultrafast-clean"
+APP_VERSION = "2.3.0-auto-clear-screenshots"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -30,6 +31,8 @@ TV_CANVAS_WAIT_CURRENT_MS = int(os.getenv("TV_CANVAS_WAIT_CURRENT_MS", "1400"))
 TV_CANVAS_WAIT_BALANCED_MS = int(os.getenv("TV_CANVAS_WAIT_BALANCED_MS", "9000"))
 HTTP_TIMEOUT_CURRENT = int(os.getenv("HTTP_TIMEOUT_CURRENT", "5"))
 HTTP_TIMEOUT_BALANCED = int(os.getenv("HTTP_TIMEOUT_BALANCED", "10"))
+AUTO_CLEAR_SCREENSHOTS = os.getenv("AUTO_CLEAR_SCREENSHOTS", "true").lower() in {"1", "true", "yes", "on"}
+SCREENSHOT_KEEP_LAST = int(os.getenv("SCREENSHOT_KEEP_LAST", "0"))
 
 TV_INTERVALS = {"1m": "1", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "1h": "60", "1d": "D"}
 YF_INTERVALS = {"1m": "1m", "3m": "5m", "5m": "5m", "10m": "15m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d"}
@@ -144,7 +147,7 @@ class ChartResponse(BaseModel):
 
 app = FastAPI(
     title="BIST Chart GPT Action API",
-    description="ChatGPT Actions uyumlu BIST grafik servisi: TradingView screenshot + Yahoo/Stooq/Midas/BloombergHT/Investing/Borsa İstanbul doğrulama katmanları.",
+    description="ChatGPT Actions compatible BIST chart service: TradingView screenshot + Yahoo/Stooq/Midas/BloombergHT/Investing/Borsa Istanbul verification layers.",
     version=APP_VERSION,
 )
 app.mount("/screenshots", StaticFiles(directory=str(SCREENSHOT_DIR)), name="screenshots")
@@ -155,7 +158,7 @@ async def shutdown_event():
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "endpoints": ["/health", "/warmup", "/chart"]}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "endpoints": ["/health", "/warmup", "/chart", "/screenshots-list", "/screenshots-clear"]}
 
 @app.get("/health")
 def health():
@@ -230,13 +233,56 @@ async def click_soft_popups(page: Page):
         except Exception:
             pass
 
+
+def screenshot_has_chart_content(path: Path) -> bool:
+    """Reject blank/loading TradingView screenshots before giving them to GPT.
+    The check focuses on the main chart canvas area and ignores right watchlist panels.
+    """
+    try:
+        img = Image.open(path).convert("RGB")
+        w, h = img.size
+        # Main TradingView chart area for our 1440x950 viewport. Exclude left toolbar/right watchlist/top bar as much as possible.
+        left = int(w * 0.045)
+        top = int(h * 0.07)
+        right = int(w * 0.755)
+        bottom = int(h * 0.94)
+        crop = img.crop((left, top, right, bottom))
+        pixels = crop.getdata()
+        total = max(1, crop.size[0] * crop.size[1])
+        non_white = 0
+        dark = 0
+        colorish = 0
+        for r, g, b in pixels:
+            if r < 245 or g < 245 or b < 245:
+                non_white += 1
+            if r < 205 and g < 205 and b < 205:
+                dark += 1
+            if max(r, g, b) - min(r, g, b) > 28 and min(r, g, b) < 235:
+                colorish += 1
+        non_white_ratio = non_white / total
+        dark_ratio = dark / total
+        colorish_ratio = colorish / total
+        # A loading/blank chart is almost completely white in the main plot area.
+        # Real candles/volume/grid/legend typically push these above the thresholds.
+        return (non_white_ratio >= 0.018) or (dark_ratio >= 0.010) or (colorish_ratio >= 0.004)
+    except Exception:
+        # If validation itself fails, be conservative and do not trust the image.
+        return False
+
+async def capture_and_validate(page: Page, out_path: Path, img_type: str, quality: int) -> bool:
+    if img_type == "jpeg":
+        await page.screenshot(path=str(out_path), full_page=False, type="jpeg", quality=quality, timeout=18000)
+    else:
+        await page.screenshot(path=str(out_path), full_page=False, type="png", timeout=25000)
+    return screenshot_has_chart_content(out_path)
+
 async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str = "current") -> tuple[Optional[Path], Optional[str], str, str]:
     img_type = "jpeg" if mode in {"current", "fast"} else "png"
     ext = "jpg" if img_type == "jpeg" else "png"
     filename = f"{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}.{ext}"
     out_path = SCREENSHOT_DIR / filename
     chart_status = "ok"
-    chart_note = "TradingView grafiği yüklendi ve screenshot alındı."
+    chart_note = "TradingView chart loaded and screenshot was captured."
     ctx = await BROWSER.get_context()
     page = None
     try:
@@ -248,29 +294,55 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
             await page.goto(url, wait_until="domcontentloaded", timeout=60000 if mode in {"current", "fast"} else 90000)
         except PlaywrightTimeoutError:
             chart_status = "partial_timeout"
-            chart_note = "TradingView domcontentloaded timeout verdi; eldeki sayfa screenshotlandı."
-        await page.wait_for_timeout(TV_WAIT_CURRENT_MS if mode in {"current", "fast"} else TV_WAIT_BALANCED_MS)
-        await click_soft_popups(page)
+            chart_note = "TradingView domcontentloaded timeout; available viewport was captured."
+        # Do not capture the loading screen. Wait/retry until the chart area has real visual content.
+        base_wait = TV_WAIT_CURRENT_MS if mode in {"current", "fast"} else TV_WAIT_BALANCED_MS
+        canvas_wait = TV_CANVAS_WAIT_CURRENT_MS if mode in {"current", "fast"} else TV_CANVAS_WAIT_BALANCED_MS
+        max_attempts = 3 if mode in {"current", "fast"} else 4
+        verified_image = False
         canvas_found = False
-        for selector in ["canvas", "div.chart-container", "div[data-name='legend-source-item']"]:
+        last_validation_note = ""
+        for attempt in range(1, max_attempts + 1):
+            await page.wait_for_timeout(base_wait if attempt == 1 else (2500 if mode in {"current", "fast"} else 5000))
+            await click_soft_popups(page)
+            for selector in ["canvas", "div.chart-container", "div[data-name='legend-source-item']", "div[data-name='legend']"]:
+                try:
+                    await page.locator(selector).first.wait_for(state="visible", timeout=canvas_wait)
+                    canvas_found = True
+                    break
+                except Exception:
+                    pass
             try:
-                await page.locator(selector).first.wait_for(state="visible", timeout=TV_CANVAS_WAIT_CURRENT_MS if mode in {"current", "fast"} else TV_CANVAS_WAIT_BALANCED_MS)
-                canvas_found = True
-                break
-            except Exception:
-                pass
-        if not canvas_found and chart_status == "ok":
-            chart_status = "partial_no_canvas_detected"
-            chart_note = "TradingView sayfası açıldı ve viewport screenshot alındı; canvas/legend otomatik doğrulaması kesinleşmedi. Görsel yine analiz için kullanılabilir."
-        # Current mode: smaller JPEG viewport screenshot is much faster and enough for GPT vision.
-        if img_type == "jpeg":
-            await page.screenshot(path=str(out_path), full_page=False, type="jpeg", quality=82, timeout=22000)
-        else:
-            await page.screenshot(path=str(out_path), full_page=False, type="png", timeout=30000)
-        return out_path, f"/screenshots/{filename}", chart_status, chart_note
+                verified_image = await capture_and_validate(page, out_path, img_type, 82 if img_type == "jpeg" else 0)
+                if verified_image:
+                    if not canvas_found:
+                        chart_status = "ok_visual_verified"
+                        chart_note = "TradingView screenshot captured and visual content check passed; canvas selector was not conclusive."
+                    else:
+                        chart_status = "ok"
+                        chart_note = "TradingView chart loaded; screenshot captured after visual content check."
+                    return out_path, f"/screenshots/{filename}", chart_status, chart_note
+                last_validation_note = f"attempt {attempt}: screenshot looked like a blank/loading chart"
+            except Exception as shot_error:
+                last_validation_note = f"attempt {attempt}: screenshot error {type(shot_error).__name__}: {shot_error}"
+            # Reload once if current mode still captured loading/blank screen.
+            if attempt == 2 and mode in {"current", "fast"}:
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=45000)
+                except Exception:
+                    pass
+        # If every attempt is blank/loading, do not return a misleading image URL.
+        try:
+            if out_path.exists():
+                out_path.unlink()
+        except Exception:
+            pass
+        chart_status = "chart_loading_not_captured"
+        chart_note = "TradingView did not pass visual content validation, so loading/blank screenshot was not returned. " + last_validation_note
+        return None, None, chart_status, chart_note
     except Exception as e:
         chart_status = "chart_failed_data_only"
-        chart_note = f"TradingView screenshot başarısız; veri katmanları yine döndürüldü. Hata: {type(e).__name__}: {e}"
+        chart_note = f"TradingView screenshot failed; data layers were still returned. Error: {type(e).__name__}: {e}"
         try:
             if page:
                 if img_type == "jpeg":
@@ -408,6 +480,18 @@ def repair_mojibake(text: str) -> str:
         text = text.replace(a, b)
     return text
 
+def to_ascii_tr(text: str) -> str:
+    """Return an ASCII-safe version for clients that display UTF-8 JSON as mojibake."""
+    if text is None:
+        return text
+    text = repair_mojibake(str(text))
+    table = str.maketrans({
+        "ç":"c", "Ç":"C", "ğ":"g", "Ğ":"G", "ı":"i", "İ":"I",
+        "ö":"o", "Ö":"O", "ş":"s", "Ş":"S", "ü":"u", "Ü":"U",
+        "’":"'", "‘":"'", "“":"\"", "”":"\"", "–":"-", "—":"-", "…":"...",
+    })
+    return text.translate(table)
+
 def clean_html_text(html: str) -> list[str]:
     html = repair_mojibake(html)
     text = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
@@ -419,16 +503,21 @@ def clean_html_text(html: str) -> list[str]:
 
 def extract_context_text(html: str, symbol: str, limit: int = 900) -> str:
     lines = clean_html_text(html)
-    hits = [x for x in lines if symbol.upper() in x.upper() or "BIST" in x.upper() or "ALIŞ" in x.upper() or "SATIŞ" in x.upper() or "HACİM" in x.upper() or "SON" in x.upper()]
-    # Keep only compact, analysis-useful context. Long company biographies slow GPT and bloat responses.
+    symbol_u = symbol.upper()
+    useful_terms = (symbol_u, "BIST", "ALIS", "SATIS", "HACIM", "SON", "FIYAT", "%")
+    skip_terms = ("sirket hakkinda", "ortaklik", "calisan", "nasil", "indirerek", "yorumlari", "haberleri")
     cleaned = []
     seen = set()
-    for h in hits:
-        h = h.strip()
-        if len(h) < 2 or h in seen:
+    for h in lines:
+        h_fixed = to_ascii_tr(h).strip()
+        h_low = h_fixed.lower()
+        if len(h_fixed) < 2 or h_fixed in seen:
             continue
-        seen.add(h)
-        cleaned.append(h)
+        if any(x in h_low for x in skip_terms):
+            continue
+        if any(term in h_fixed.upper() for term in useful_terms):
+            seen.add(h_fixed)
+            cleaned.append(h_fixed)
         if len(" | ".join(cleaned)) >= limit:
             break
     return " | ".join(cleaned)[:limit]
@@ -463,39 +552,64 @@ def fetch_public_quotes(symbol: str, mode: str = "balanced") -> tuple[list[dict]
         html, err = http_get_text(url, timeout=timeout)
         entry = {"source": name, "url": url, "status": "ok" if html else "error", "note": None, "context": None}
         if err:
-            entry["note"] = repair_mojibake(err)
+            entry["note"] = to_ascii_tr(err)
         else:
-            ctx_limit = 520 if mode in {"current", "fast"} else 1200
-            entry["context"] = repair_mojibake(extract_context_text(html, symbol, ctx_limit))
+            ctx_limit = 260 if mode in {"current", "fast"} else 900
+            entry["context"] = to_ascii_tr(extract_context_text(html, symbol, ctx_limit))
             if name.startswith("Midas"):
-                entry["note"] = "Midas canlı borsa sayfası BIST kaynaklı en az 15 dakika gecikmeli olabilir; ek fiyat teyidi olarak kullanılır."
+                entry["note"] = "Midas live market page can be at least 15 minutes delayed from BIST; used as secondary price verification."
             if name.startswith("BloombergHT"):
-                entry["note"] = "BloombergHT sayfası fiyat/yüzde/hacim teyidi için ek kaynak olarak kullanılır."
+                entry["note"] = "BloombergHT page is used as an additional price/percent/volume verification source."
             if name.startswith("Investing"):
-                entry["note"] = "Investing sayfası fiyat/yüzde ve haber bağlamı için ek kaynak olarak kullanılır."
+                entry["note"] = "Investing page is used for additional price/percent and news context."
         snapshots.append(entry)
     official = {
-        "source": "Borsa İstanbul",
+        "source": "Borsa Istanbul",
         "status": "reference_only",
         "url": "https://www.borsaistanbul.com/",
-        "note": "Resmi kaynak/duyuru/günlük bülten referansı. Ücretsiz canlı 1dk/5dk mum API kaynağı gibi kullanılmaz.",
+        "note": "Official reference/news/daily bulletin source. Not used as a free live 1m/5m candle API.",
     }
     QUOTE_CACHE[cache_key] = (time.time(), snapshots, official)
     return snapshots, official
 
 def build_ohlc(symbol: str, yahoo_symbol: str, interval: str, range_hint: str, target_date: Optional[str], mode: str = "balanced") :
     if mode == "current" and not target_date:
-        return [], "current_quote_only", "Current mode: güncel grafik hız öncelikli; yavaş Yahoo/Stooq OHLC çağrıları atlandı. Fiyat teyidi public quote katmanlarından yapılır."
+        return [], "current_quote_only", "Current mode: speed-first current chart; slow Yahoo/Stooq OHLC calls skipped. Price verification uses public quote layers."
     records, status, note = fetch_yahoo_ohlc(yahoo_symbol, interval, range_hint, target_date)
     if records:
         return records, status, note
     if mode == "fast":
-        return [], "fast_no_ohlc", f"{note} | Fast mode: Stooq günlük fallback atlandı."
+        return [], "fast_no_ohlc", f"{note} | Fast mode: Stooq daily fallback skipped."
     stooq_records, stooq_status, stooq_note = fetch_stooq_daily(symbol)
     combined_note = f"{note} | {stooq_note}"
     if stooq_records:
         return stooq_records, stooq_status, combined_note
     return [], "no_ohlc_all_sources", combined_note
+
+
+def clear_screenshot_files(keep_last: int = 0) -> dict:
+    all_files = sorted([p for p in SCREENSHOT_DIR.glob("*") if p.is_file()], key=lambda x: x.stat().st_mtime, reverse=True)
+    deleted = 0
+    for p in all_files[keep_last:]:
+        try:
+            p.unlink()
+            deleted += 1
+        except Exception:
+            pass
+    return {"deleted": deleted, "kept": min(keep_last, len(all_files))}
+
+@app.get("/screenshots-list")
+def screenshots_list(limit: int = Query(30, ge=1, le=200)):
+    files = []
+    for p in sorted(SCREENSHOT_DIR.glob("*"), key=lambda x: x.stat().st_mtime, reverse=True)[:limit]:
+        if p.is_file():
+            files.append({"filename": p.name, "size_kb": round(p.stat().st_size / 1024, 1), "modified_utc": datetime.fromtimestamp(p.stat().st_mtime, timezone.utc).isoformat(), "url_path": f"/screenshots/{p.name}"})
+    return {"count": len(files), "files": files}
+
+@app.post("/screenshots-clear")
+def screenshots_clear(keep_last: int = Query(0, ge=0, le=500)):
+    result = clear_screenshot_files(keep_last=keep_last)
+    return {"ok": True, **result}
 
 @app.get("/chart", response_model=ChartResponse)
 async def chart(
@@ -505,7 +619,8 @@ async def chart(
     range_hint: str = Query("5d", description="Yahoo period ipucu: 1d, 5d, 1mo, 3mo, 6mo, 1y..."),
     target_date: Optional[str] = Query(None, description="YYYY-MM-DD; tarihli analiz için doğrulama notu/veri aralığı."),
     include_base64: bool = Query(False, description="true ise screenshot base64 döner; genelde false kalsın."),
-    mode: str = Query("current", description="current, fast veya balanced. current güncel grafik için en hızlı güvenli moddur; balanced tarihsel/OHLC için daha detaylıdır."),
+    mode: str = Query("current", description="current, fast veya balanced. current guncel grafik icin en hizli guvenli moddur; balanced tarihsel/OHLC icin daha detaylidir."),
+    auto_clear: bool = Query(True, description="true ise yeni grafik isteginden once eski screenshot dosyalarini siler."),
 ):
     clean_symbol = normalize_symbol(symbol)
     if interval not in TV_INTERVALS:
@@ -516,6 +631,10 @@ async def chart(
         raise HTTPException(status_code=400, detail="target_date YYYY-MM-DD formatında olmalı.")
     yahoo_symbol = make_yahoo_symbol(clean_symbol)
     tv_url = make_tv_url(clean_symbol, interval)
+
+    clear_result = {"deleted": 0, "kept": 0}
+    if auto_clear and AUTO_CLEAR_SCREENSHOTS:
+        clear_result = clear_screenshot_files(keep_last=SCREENSHOT_KEEP_LAST)
 
     screenshot_task = screenshot_tradingview(tv_url, clean_symbol, interval, mode)
     ohlc_task = run_in_threadpool(build_ohlc, clean_symbol, yahoo_symbol, interval, range_hint, target_date, mode)
@@ -529,10 +648,10 @@ async def chart(
     if include_base64 and out_path and out_path.exists():
         screenshot_base64 = base64.b64encode(out_path.read_bytes()).decode("utf-8")
 
-    final_note = (
-        f"{chart_note} | {data_note} | Ücretsiz kaynaklarda BIST intraday verileri gecikmeli/sınırlı/eksik olabilir. "
-        "Mikro yapı, derinlik, AKD/BOFA ve karanlık oda için aracı kurum ekranı gerekir. "
-        "GPT analizi önce screenshot'ı, sonra OHLC ve public quote teyitlerini birlikte değerlendirmelidir."
+    final_note = to_ascii_tr(
+        f"{chart_note} | Screenshot cleanup before capture: deleted={clear_result.get('deleted', 0)}, kept={clear_result.get('kept', 0)}. | {data_note} | Ucretsiz kaynaklarda BIST intraday verileri gecikmeli/sinirli/eksik olabilir. "
+        "Mikro yapi, derinlik, AKD/BOFA ve karanlik oda icin araci kurum ekrani gerekir. "
+        "GPT analizi once screenshot, sonra OHLC ve public quote teyitlerini birlikte degerlendirmelidir."
     )
 
     return ChartResponse(
@@ -543,7 +662,7 @@ async def chart(
         range_hint=range_hint,
         target_date=target_date,
         source_chart="TradingView visual chart screenshot via persistent Playwright browser",
-        source_data="TradingView screenshot + fast public quote checks; Yahoo/Stooq OHLC only in balanced/dated modes + Borsa İstanbul official reference",
+        source_data="TradingView screenshot + fast public quote checks; Yahoo/Stooq OHLC only in balanced/dated modes + Borsa Istanbul official reference",
         tradingview_url=tv_url,
         screenshot_url=screenshot_url,
         screenshot_base64_png=screenshot_base64,

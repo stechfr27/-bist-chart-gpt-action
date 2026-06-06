@@ -2,33 +2,33 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BIST Chart GPT Action API",
-    "description": "BIST hisseleri için hızlı güncel TradingView screenshot, public quote doğrulama ve gerektiğinde Yahoo/Stooq OHLC sağlar.",
-    "version": "1.9.0"
+    "version": "2.3.0-auto-clear-screenshots",
+    "description": "Fast current TradingView screenshot and public quote verification for BIST stocks. Balanced mode can use Yahoo/Stooq OHLC fallbacks."
   },
   "servers": [
     {
-      "url": "https://bist-chart-gpt-action.onrender.com"
+      "url": "https://YOUR-RENDER-URL.onrender.com"
     }
   ],
   "paths": {
     "/health": {
       "get": {
-        "operationId": "checkBistChartApiHealth",
-        "summary": "API sağlık ve sürüm kontrolü",
+        "operationId": "healthCheck",
+        "summary": "Check service health",
         "responses": {
           "200": {
-            "description": "Servis durumu"
+            "description": "Service health"
           }
         }
       }
     },
     "/warmup": {
       "get": {
-        "operationId": "warmupBistChartBrowser",
-        "summary": "TradingView browser warmup yapar",
+        "operationId": "warmupBrowser",
+        "summary": "Warm up browser for faster chart screenshots",
         "responses": {
           "200": {
-            "description": "Browser hazır"
+            "description": "Warmup result"
           }
         }
       }
@@ -36,7 +36,7 @@
     "/chart": {
       "get": {
         "operationId": "getBistChartSnapshot",
-        "summary": "BIST hissesi için grafik screenshot ve doğrulama verisi al",
+        "summary": "Get BIST chart screenshot and verification data",
         "parameters": [
           {
             "name": "symbol",
@@ -45,7 +45,7 @@
             "schema": {
               "type": "string"
             },
-            "description": "BIST sembolü. Örn: THYAO, ASELS, TUPRS"
+            "description": "BIST symbol, e.g. THYAO, ASELS, TUPRS"
           },
           {
             "name": "interval",
@@ -53,6 +53,7 @@
             "required": false,
             "schema": {
               "type": "string",
+              "default": "5m",
               "enum": [
                 "1m",
                 "3m",
@@ -62,9 +63,9 @@
                 "30m",
                 "1h",
                 "1d"
-              ],
-              "default": "5m"
-            }
+              ]
+            },
+            "description": "Chart interval"
           },
           {
             "name": "range_hint",
@@ -72,9 +73,9 @@
             "required": false,
             "schema": {
               "type": "string",
-              "default": "1d"
+              "default": "5d"
             },
-            "description": "Yahoo period ipucu. Güncel analizde önemli değildir; balanced/tarihli analizde kullanılır."
+            "description": "Yahoo period hint for balanced mode"
           },
           {
             "name": "target_date",
@@ -83,22 +84,7 @@
             "schema": {
               "type": "string"
             },
-            "description": "YYYY-MM-DD formatında tarihli analiz isteği."
-          },
-          {
-            "name": "mode",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "current",
-                "fast",
-                "balanced"
-              ],
-              "default": "current"
-            },
-            "description": "current: güncel grafik için en hızlı güvenli mod; TradingView screenshot + Midas/Bloomberg hızlı teyit. balanced: OHLC/Yahoo/Stooq daha detaylı."
+            "description": "YYYY-MM-DD for dated analysis"
           },
           {
             "name": "include_base64",
@@ -108,12 +94,27 @@
               "type": "boolean",
               "default": false
             },
-            "description": "true ise screenshot base64 döner; normalde false kalmalı."
+            "description": "Return screenshot base64. Usually false."
+          },
+          {
+            "name": "mode",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "current",
+              "enum": [
+                "current",
+                "fast",
+                "balanced"
+              ]
+            },
+            "description": "current: fastest live chart mode. balanced: slower OHLC fallback mode."
           }
         ],
         "responses": {
           "200": {
-            "description": "Grafik screenshot URL'i ve doğrulama verileri"
+            "description": "Chart screenshot and verification data"
           }
         }
       }
