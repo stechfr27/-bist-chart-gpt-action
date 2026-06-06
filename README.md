@@ -1,17 +1,14 @@
-# BIST Chart GPT Action v5.4
+# BIST Chart GPT Action v5.5 - Graph Only
 
-Range-core debug/budgeted build.
+This version focuses only on returning a verified TradingView chart screenshot.
+It intentionally skips Yahoo/Stooq/Midas/Bloomberg/Borsa Istanbul data calls.
 
-Core rules:
-- Current request target: Istanbul today 09:55 -> current Istanbul time + 1 minute, capped at 18:10.
-- Historical target_date request: target date 09:55 -> 18:10.
-- 5m stays strict; no 10m/15m fallback.
-- TradingView actual chart image only; no Midas/Bloomberg visual fallback.
-- Last-candle hover remains enabled above the detected final candle column.
-- Custom range is a core target and each stage is reported in `data_note`.
+Required env:
+- BROWSERLESS_WS_ENDPOINT
+- PORT=10000
+- PYTHONUNBUFFERED=1
 
-Important env vars:
-- `BROWSERLESS_WS_ENDPOINT`: Browserless websocket endpoint.
-- `TV_CUSTOM_RANGE_MAX_SECONDS=11` default.
-- `TV_USE_CUSTOM_RANGE=true` default.
-- `TV_HOVER_LAST_CANDLE=true` default.
+Main endpoint:
+- /chart?symbol=THYAO&interval=5m&mode=current&view=session
+
+Rule: if screenshot_url is null, the GPT must not do chart analysis.

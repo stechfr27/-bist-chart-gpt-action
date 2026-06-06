@@ -19,7 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "5.4.0-range-attempt-json-debug"
+APP_VERSION = "5.5.0-graph-only-range-core"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -197,7 +197,7 @@ class ChartResponse(BaseModel):
 
 app = FastAPI(
     title="BIST Chart GPT Action API",
-    description="ChatGPT Actions compatible BIST chart service: strict TradingView screenshot first; no loading screen or non-chart fallback is returned as chart.",
+    description="ChatGPT Actions compatible BIST chart service: graph-only strict TradingView screenshot service. External market data is intentionally excluded.",
     version=APP_VERSION,
 )
 app.mount("/screenshots", StaticFiles(directory=str(SCREENSHOT_DIR)), name="screenshots")
@@ -1096,7 +1096,7 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
         )
         notes.append(note)
         if out_path and shot_path:
-            return out_path, shot_path, "ok_tradingview_full_chart", " | ".join(notes + ["Exact TradingView chart path: full chart; session_tight_fit aggressively zooms the latest BIST session so the previous day is minimized, 5m candles are more readable, and the right-side watchlist/info panel is cropped out; quote/stat context is returned separately in quote_snapshots."])
+            return out_path, shot_path, "ok_tradingview_full_chart", " | ".join(notes + ["Exact TradingView chart path: full chart; session_tight_fit aggressively zooms the latest BIST session so the previous day is minimized, 5m candles are more readable, and the right-side watchlist/info panel is cropped out; external quote/stat context is intentionally not returned by this graph-only endpoint."])
 
         return None, None, "strict_tradingview_image_failed", " | ".join(notes + ["No verified TradingView chart image returned. No public quote-page fallback was used, because user requested the actual chart screenshot only."])
 
@@ -1387,26 +1387,20 @@ async def chart(
         clear_result = clear_screenshot_files(keep_last=SCREENSHOT_KEEP_LAST)
 
     request_timeout = TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS if mode == "safe_current" else (TOTAL_BALANCED_HARD_TIMEOUT_SECONDS if mode == "balanced" else TOTAL_CHART_HARD_TIMEOUT_SECONDS)
-    screenshot_task = asyncio.create_task(screenshot_tradingview(tv_url, clean_symbol, interval, mode, view, target_date))
-    ohlc_task = asyncio.create_task(run_in_threadpool(build_ohlc, clean_symbol, yahoo_symbol, interval, range_hint, target_date, mode))
-    quotes_task = asyncio.create_task(run_in_threadpool(fetch_public_quotes, clean_symbol, mode))
-
+    # v5.5 GRAPH-ONLY MODE:
+    # Do not call Yahoo/Stooq/Midas/Bloomberg/Borsa Istanbul here.
+    # The only responsibility of this API is to return the correct TradingView chart image.
+    # Market/news/quote verification must be handled by the GPT or another action.
     try:
-        # Graph-first: give the TradingView image the budget. Verification data must not block the chart.
-        out_path, shot_path, chart_status, chart_note = await asyncio.wait_for(screenshot_task, timeout=request_timeout)
+        out_path, shot_path, chart_status, chart_note = await asyncio.wait_for(
+            screenshot_tradingview(tv_url, clean_symbol, interval, mode, view, target_date),
+            timeout=request_timeout,
+        )
     except asyncio.TimeoutError:
         out_path, shot_path, chart_status, chart_note = None, None, "request_timeboxed_no_image", f"Request timeboxed at {request_timeout}s; no unverified image returned."
 
-    try:
-        # In current modes build_ohlc returns immediately; if a thread stalls, skip it without touching chart speed.
-        records, data_status, data_note = await asyncio.wait_for(ohlc_task, timeout=1 if mode in {"current", "fast", "safe_current"} else 20)
-    except Exception:
-        records, data_status, data_note = [], "ohlc_nonblocking_skipped", "OHLC layer was skipped/non-blocking so graph capture stays fast."
-
-    try:
-        quote_snapshots, official_reference = await asyncio.wait_for(quotes_task, timeout=QUOTE_CURRENT_HARD_TIMEOUT_SECONDS if mode in {"current", "fast", "safe_current"} else 12)
-    except Exception:
-        quote_snapshots, official_reference = [], {"source": "Borsa Istanbul", "status": "reference_only", "url": "https://www.borsaistanbul.com/", "note": "Official reference/news/daily bulletin source."}
+    records, data_status, data_note = [], "graph_only_no_market_data", "Graph-only mode: external OHLC/quote/news/data layers are intentionally skipped. The GPT should fetch current market/news information separately if needed."
+    quote_snapshots, official_reference = [], {}
 
     screenshot_base64 = None
     screenshot_url = absolute_url(request, shot_path) if shot_path else None
@@ -1418,7 +1412,7 @@ async def chart(
     final_note = to_ascii_tr(
         f"{chart_note} | Screenshot cleanup before capture: deleted={clear_result.get('deleted', 0)}, kept={clear_result.get('kept', 0)}. | {data_note} | Ucretsiz kaynaklarda BIST intraday verileri gecikmeli/sinirli/eksik olabilir. "
         "Mikro yapi, derinlik, AKD/BOFA ve karanlik oda icin araci kurum ekrani gerekir. "
-        "GPT analizi once screenshot, sonra OHLC ve public quote teyitlerini birlikte degerlendirmelidir."
+        "This endpoint only verifies and returns the chart image. The GPT must fetch market/news/quote information with separate sources if needed."
     )
 
     return ChartResponse(
@@ -1429,7 +1423,7 @@ async def chart(
         range_hint=range_hint,
         target_date=target_date,
         source_chart="TradingView visual chart screenshot via Browserless remote browser; uses native custom range as a core target (current 09:45→now+1m capped 18:10, historical 09:45→18:10) and image-detected last-candle hover above the final candle column",
-        source_data="Strict TradingView image-first capture with session-tight-fit chart-only capture; Midas/BloombergHT provide external market info; no non-chart visual fallback; quotes are secondary and non-blocking",
+        source_data="Graph-only strict TradingView image capture. No Midas/Bloomberg/Yahoo/Stooq/BIST market-data calls are made by this endpoint.",
         tradingview_url=tv_url,
         screenshot_url=screenshot_url,
         screenshot_base64_png=screenshot_base64,
@@ -1439,7 +1433,7 @@ async def chart(
         ohlc_count=len(records),
         quote_snapshots=quote_snapshots,
         official_reference=official_reference,
-        data_status=data_status if records else ("public_quote_fallback" if quote_snapshots else data_status),
+        data_status=data_status,
         data_note=final_note,
         performance_note=(("browserless remote + " if BROWSERLESS_WS_ENDPOINT else "local browser + ") + ("safe_current mode: strict TradingView-only visual capture; local widget -> widgetembed -> full chart" if mode == "safe_current" else "current mode: strict TradingView-only visual capture; local widget -> widgetembed -> full chart") if mode in {"current", "fast", "safe_current"} else "balanced mode: strict TradingView + slower OHLC fallback enabled"),
         captured_at_utc=datetime.now(timezone.utc).isoformat(),
