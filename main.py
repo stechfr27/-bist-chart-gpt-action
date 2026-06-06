@@ -4,7 +4,7 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import asyncio
 from PIL import Image
@@ -19,7 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "5.0.0-snapshot-download-first"
+APP_VERSION = "5.1.0-custom-range-last-candle"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -54,9 +54,14 @@ CHART_CLIP_HEIGHT_RATIO = float(os.getenv("CHART_CLIP_HEIGHT_RATIO", "1.00"))
 # For BIST current/session screenshots, crop out older sessions on the left so the latest trading day is wider.
 # 0.0 = no left crop. Typical values: 0.30-0.42. Default tuned from THYAO 5m tests.
 SESSION_LEFT_CROP_RATIO = float(os.getenv("SESSION_LEFT_CROP_RATIO", "0.00"))
-BIST_SESSION_START = os.getenv("BIST_SESSION_START", "09:55")
+BIST_SESSION_START = os.getenv("BIST_SESSION_START", "09:45")
 BIST_SESSION_END = os.getenv("BIST_SESSION_END", "18:10")
-BIST_SESSION_STRICT_NOTE = "BIST 5m session target is 09:55-18:10. The system must not claim exact full-session coverage unless the x-axis visually shows that band."
+BIST_SESSION_STRICT_NOTE = "BIST 5m session target is 09:45-18:10. For current requests, end target is current Istanbul time +1 minute, capped at 18:10. The system must not claim exact full-session coverage unless the x-axis visually shows that band."
+TV_USE_CUSTOM_RANGE = os.getenv("TV_USE_CUSTOM_RANGE", "true").lower() in {"1", "true", "yes", "on"}
+TV_CUSTOM_RANGE_START = os.getenv("TV_CUSTOM_RANGE_START", BIST_SESSION_START)
+TV_CUSTOM_RANGE_END = os.getenv("TV_CUSTOM_RANGE_END", BIST_SESSION_END)
+TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES = int(os.getenv("TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES", "1"))
+TV_IMAGE_DETECT_LAST_CANDLE = os.getenv("TV_IMAGE_DETECT_LAST_CANDLE", "true").lower() in {"1", "true", "yes", "on"}
 
 # TradingView UI adjustment: try to maximize graph area and place the crosshair just above
 # the latest candle column so TradingView's top legend/volume reflects the last candle.
@@ -66,11 +71,6 @@ TV_HOVER_LAST_CANDLE = os.getenv("TV_HOVER_LAST_CANDLE", "true").lower() in {"1"
 TV_CLICK_LAST_CANDLE_COLUMN = os.getenv("TV_CLICK_LAST_CANDLE_COLUMN", "true").lower() in {"1", "true", "yes", "on"}
 TV_LAST_CANDLE_X_RATIO = float(os.getenv("TV_LAST_CANDLE_X_RATIO", "0.965"))
 TV_LAST_CANDLE_Y_RATIO = float(os.getenv("TV_LAST_CANDLE_Y_RATIO", "0.38"))
-
-# v5 snapshot-first: try the chart provider's own exported image before raw viewport screenshot.
-TV_SNAPSHOT_DOWNLOAD_FIRST = os.getenv("TV_SNAPSHOT_DOWNLOAD_FIRST", "true").lower() in {"1", "true", "yes", "on"}
-TV_SNAPSHOT_TIMEOUT_MS = int(os.getenv("TV_SNAPSHOT_TIMEOUT_MS", "9000"))
-TV_SNAPSHOT_MENU_TIMEOUT_MS = int(os.getenv("TV_SNAPSHOT_MENU_TIMEOUT_MS", "2500"))
 
 TV_INTERVALS = {"1m": "1", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "1h": "60", "1d": "D"}
 YF_INTERVALS = {"1m": "1m", "3m": "5m", "5m": "5m", "10m": "15m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d"}
@@ -137,7 +137,6 @@ class BrowserManager:
 
             self._context = await self._browser.new_context(
                 viewport={"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT},
-                accept_downloads=True,
                 device_scale_factor=1,
                 locale="tr-TR",
                 timezone_id="Europe/Istanbul",
@@ -181,8 +180,6 @@ class ChartResponse(BaseModel):
     source_chart: str
     source_data: str
     tradingview_url: str
-    capture_method_used: str = "unknown"
-    download_attempt_note: str = ""
     screenshot_url: Optional[str] = None
     screenshot_base64_png: Optional[str] = Field(default=None, description="include_base64=true ise gelir; aksi halde null döner.")
     chart_status: str
@@ -197,7 +194,7 @@ class ChartResponse(BaseModel):
 
 app = FastAPI(
     title="BIST Chart GPT Action API",
-    description="ChatGPT Actions compatible BIST chart service: TradingView snapshot/download first, strict screenshot fallback; no loading screen or non-chart fallback is returned as chart.",
+    description="ChatGPT Actions compatible BIST chart service: strict TradingView screenshot first; no loading screen or non-chart fallback is returned as chart.",
     version=APP_VERSION,
 )
 app.mount("/screenshots", StaticFiles(directory=str(SCREENSHOT_DIR)), name="screenshots")
@@ -212,7 +209,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END, "strict_note": BIST_SESSION_STRICT_NOTE}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO}}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END, "strict_note": BIST_SESSION_STRICT_NOTE}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO, "image_detect_last_candle": TV_IMAGE_DETECT_LAST_CANDLE}, "custom_range": {"enabled": TV_USE_CUSTOM_RANGE, "session_start": TV_CUSTOM_RANGE_START, "session_end": TV_CUSTOM_RANGE_END, "current_plus_minutes": TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES}}
 
 @app.get("/warmup")
 async def warmup():
@@ -381,6 +378,206 @@ async def click_soft_popups(page: Page):
 
 
 
+
+def get_istanbul_now():
+    try:
+        import zoneinfo
+        return datetime.now(zoneinfo.ZoneInfo("Europe/Istanbul"))
+    except Exception:
+        return datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(hours=3)
+
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    try:
+        h, m = value.strip().split(":")[:2]
+        return max(0, min(23, int(h))), max(0, min(59, int(m)))
+    except Exception:
+        return 9, 45
+
+def build_target_session_window(target_date: Optional[str]) -> dict:
+    """Build the user's requested BIST session window.
+
+    Current request: 09:45 -> Istanbul now +1m, capped at 18:10.
+    Historical target_date: 09:45 -> 18:10 for that date.
+    """
+    now_tr = get_istanbul_now()
+    sh, sm = _parse_hhmm(TV_CUSTOM_RANGE_START)
+    eh, em = _parse_hhmm(TV_CUSTOM_RANGE_END)
+    if target_date:
+        try:
+            base = datetime.fromisoformat(target_date).date()
+            start_dt = datetime(base.year, base.month, base.day, sh, sm)
+            end_dt = datetime(base.year, base.month, base.day, eh, em)
+        except Exception:
+            start_dt = now_tr.replace(hour=sh, minute=sm, second=0, microsecond=0)
+            end_dt = now_tr.replace(hour=eh, minute=em, second=0, microsecond=0)
+    else:
+        start_dt = now_tr.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        hard_end = now_tr.replace(hour=eh, minute=em, second=0, microsecond=0)
+        end_dt = now_tr + timedelta(minutes=TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES)
+        if end_dt > hard_end:
+            end_dt = hard_end
+        if end_dt <= start_dt:
+            end_dt = hard_end
+    return {
+        "start": start_dt,
+        "end": end_dt,
+        "start_label": start_dt.strftime("%d.%m.%Y %H:%M"),
+        "end_label": end_dt.strftime("%d.%m.%Y %H:%M"),
+        "date_label": start_dt.strftime("%d.%m.%Y"),
+    }
+
+async def try_tradingview_custom_date_range(page: Page, target_date: Optional[str], view: str) -> str:
+    """Best-effort use of TradingView's built-in custom date range control.
+
+    This is intentionally defensive. TradingView changes selectors often, so the API
+    must continue even when the control cannot be automated. It tries to open the
+    bottom date-range/calendar control, select custom range, fill start/end fields,
+    and confirm.
+    """
+    if not TV_USE_CUSTOM_RANGE or view not in {"session", "full_day", "day"}:
+        return "custom range skipped"
+    window = build_target_session_window(target_date)
+    notes = [f"target session range {window['start_label']} -> {window['end_label']}"]
+    try:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(150)
+    except Exception:
+        pass
+    # First click the bottom date-range/calendar button area if visible.
+    candidates = [
+        "button[aria-label*='Date Range' i]", "button[aria-label*='Tarih' i]", "button[aria-label*='Takvim' i]",
+        "button:has-text('Tümü')", "button:has-text('Tüm')", "button:has-text('1G')", "button:has-text('1D')",
+        "[data-name*='date' i]", "[data-name*='range' i]", "[data-name*='go-to-date' i]",
+    ]
+    opened = False
+    for sel in candidates:
+        try:
+            loc = page.locator(sel).last
+            if await loc.is_visible(timeout=450):
+                await loc.click(timeout=700)
+                await page.wait_for_timeout(700)
+                opened = True
+                notes.append(f"opened range control via {sel}")
+                break
+        except Exception:
+            pass
+    if not opened:
+        # Coordinate fallback: bottom-left range toolbar / calendar area.
+        try:
+            await page.mouse.click(335, TV_VIEWPORT_HEIGHT - 36)
+            await page.wait_for_timeout(700)
+            opened = True
+            notes.append("opened range control via bottom-left coordinate fallback")
+        except Exception as e:
+            notes.append(f"range control open failed: {type(e).__name__}")
+    if not opened:
+        return " | ".join(notes)
+    # Click custom range item if present.
+    custom_texts = ["Özel aralık", "Ozel aralik", "Custom range", "Özel", "Custom"]
+    for txt in custom_texts:
+        try:
+            await page.get_by_text(txt, exact=False).first.click(timeout=900)
+            await page.wait_for_timeout(700)
+            notes.append(f"clicked custom range text: {txt}")
+            break
+        except Exception:
+            pass
+    # Fill visible text/date inputs. We try a few common formats; TradingView accepts different formats by locale.
+    values = [
+        window["start"].strftime("%d.%m.%Y %H:%M"),
+        window["end"].strftime("%d.%m.%Y %H:%M"),
+        window["start"].strftime("%Y-%m-%d %H:%M"),
+        window["end"].strftime("%Y-%m-%d %H:%M"),
+    ]
+    try:
+        inputs = page.locator("input")
+        count = min(await inputs.count(), 6)
+        if count >= 2:
+            # Prefer first two writable inputs.
+            written = 0
+            for i in range(count):
+                if written >= 2:
+                    break
+                try:
+                    inp = inputs.nth(i)
+                    if await inp.is_visible(timeout=250):
+                        await inp.click(timeout=500)
+                        await page.keyboard.press("Control+A")
+                        await page.keyboard.type(values[written], delay=15)
+                        written += 1
+                        await page.wait_for_timeout(120)
+                except Exception:
+                    pass
+            notes.append(f"filled {written} custom range input(s)")
+    except Exception as e:
+        notes.append(f"input fill failed: {type(e).__name__}")
+    # Confirm/apply.
+    apply_texts = ["Uygula", "Tamam", "Apply", "OK", "Done"]
+    clicked_apply = False
+    for txt in apply_texts:
+        try:
+            await page.get_by_text(txt, exact=False).last.click(timeout=800)
+            clicked_apply = True
+            notes.append(f"clicked apply text: {txt}")
+            break
+        except Exception:
+            pass
+    if not clicked_apply:
+        try:
+            await page.keyboard.press("Enter")
+            notes.append("pressed Enter to apply custom range")
+        except Exception:
+            pass
+    await page.wait_for_timeout(1600)
+    return " | ".join(notes)
+
+async def detect_latest_candle_point_from_page(page: Page) -> Optional[tuple[int, int, str]]:
+    """Find the rightmost visible red/green candle body/wick from a temporary screenshot.
+
+    Returns a point a little above that candle column. This is much more reliable
+    than a fixed x-ratio when TradingView leaves future whitespace on the right.
+    """
+    if not TV_IMAGE_DETECT_LAST_CANDLE:
+        return None
+    temp = SCREENSHOT_DIR / f"_hover_probe_{uuid.uuid4().hex[:8]}.jpg"
+    try:
+        await page.screenshot(path=str(temp), full_page=False, type="jpeg", quality=62, timeout=5000)
+        img = Image.open(temp).convert("RGB")
+        w, h = img.size
+        # Exclude top toolbar and volume pane. Use main candle plot area only.
+        x0 = int(w * 0.035)
+        x1 = int(w * min(0.985, CHART_CLIP_WIDTH_RATIO if CHART_ONLY_SCREENSHOT else 0.985))
+        y0 = int(h * 0.08)
+        y1 = int(h * 0.72)
+        rightmost = []
+        # Identify TradingView candle colors: teal/green and red/pink vertical pixels.
+        for y in range(y0, y1, 2):
+            for x in range(x0, x1, 2):
+                r, g, b = img.getpixel((x, y))
+                is_green = (g > r + 25 and g > b + 5 and g > 90 and r < 170)
+                is_red = (r > g + 25 and r > b + 15 and r > 120 and g < 190)
+                if is_green or is_red:
+                    rightmost.append((x, y))
+        if not rightmost:
+            return None
+        max_x = max(x for x, _ in rightmost)
+        # Group pixels close to the rightmost candle column.
+        cluster = [(x, y) for x, y in rightmost if abs(x - max_x) <= 12]
+        if not cluster:
+            cluster = [(x, y) for x, y in rightmost if abs(x - max_x) <= 24]
+        min_y = min(y for _, y in cluster)
+        hover_x = max(60, min(max_x, w - 80))
+        hover_y = max(int(h * 0.12), min_y - 26)  # one tick above, not on candle body
+        return hover_x, hover_y, f"image-detected latest candle column x={hover_x}, y={hover_y}"
+    except Exception:
+        return None
+    finally:
+        try:
+            if temp.exists():
+                temp.unlink()
+        except Exception:
+            pass
+
 async def apply_session_view_controls(page: Page, view: str, target_date: Optional[str] = None):
     """Try to force TradingView to fit one full session/day on screen.
 
@@ -403,6 +600,9 @@ async def apply_session_view_controls(page: Page, view: str, target_date: Option
             break
         except Exception:
             pass
+    # Try the site's own custom range selector first: current = 09:45 -> now+1m (max 18:10),
+    # target_date = 09:45 -> 18:10. This is best-effort because TradingView changes UI selectors.
+    custom_note = await try_tradingview_custom_date_range(page, target_date, view)
     # TradingView range=1D often means "last 24h", which can show the previous session too.
     # For BIST intraday analysis the user needs the latest regular session (open->close)
     # readable, not two days compressed. Zoom around the right side of the chart so the
@@ -469,6 +669,18 @@ async def hover_latest_candle_column(page: Page):
     if not TV_HOVER_LAST_CANDLE:
         return
     try:
+        detected = await detect_latest_candle_point_from_page(page)
+        if detected:
+            dx, dy, _note = detected
+            await page.mouse.move(dx, dy)
+            await page.wait_for_timeout(220)
+            if TV_CLICK_LAST_CANDLE_COLUMN:
+                await page.mouse.click(dx, dy)
+                await page.wait_for_timeout(260)
+            await page.mouse.move(dx, dy)
+            await page.wait_for_timeout(520)
+            return
+
         right_edge = max(900, int(TV_VIEWPORT_WIDTH * CHART_CLIP_WIDTH_RATIO)) if CHART_ONLY_SCREENSHOT else TV_VIEWPORT_WIDTH
         left_crop = int(right_edge * SESSION_LEFT_CROP_RATIO) if (CHART_ONLY_SCREENSHOT and SESSION_LEFT_CROP_RATIO > 0) else 0
         left_crop = max(0, min(left_crop, right_edge - 850)) if CHART_ONLY_SCREENSHOT else 0
@@ -561,108 +773,6 @@ def screenshot_has_chart_content(path: Path) -> bool:
         # If validation itself fails, be conservative and do not trust the image.
         return False
 
-async def try_tradingview_download_image(page: Page, out_path: Path) -> tuple[bool, str]:
-    """Try TradingView's own snapshot/download-image UI.
-
-    This is preferred over a raw viewport screenshot because TradingView exports the
-    chart canvas as a clean image when the UI supports it. It is best-effort: if
-    the menu labels change or Browserless cannot stream the download, we fall back
-    to strict viewport screenshot validation.
-    """
-    if not TV_SNAPSHOT_DOWNLOAD_FIRST:
-        return False, "snapshot_download_disabled"
-
-    camera_selectors = [
-        "button[data-name='take-snapshot']",
-        "[data-name='take-snapshot']",
-        "button[data-name='snapshot-button']",
-        "[data-name='snapshot-button']",
-        "button[data-name='header-toolbar-screenshot']",
-        "[data-name='header-toolbar-screenshot']",
-        "button[aria-label*='snapshot' i]",
-        "button[aria-label*='camera' i]",
-        "button[aria-label*='Screenshot' i]",
-        "button[aria-label*='Foto' i]",
-        "button[aria-label*='Goruntu' i]",
-        "button[aria-label*='Görüntü' i]",
-    ]
-    download_texts = [
-        "Download image", "Download chart image", "Save image", "Save chart image",
-        "Goruntuyu indir", "Görüntüyü indir", "Resmi indir", "Grafiği indir", "Grafik indir",
-        "PNG", "JPG", "JPEG",
-    ]
-    notes = []
-
-    try:
-        # Close old menus/popups if any.
-        try:
-            await page.keyboard.press("Escape")
-            await page.wait_for_timeout(250)
-        except Exception:
-            pass
-
-        clicked_camera = False
-        for sel in camera_selectors:
-            try:
-                loc = page.locator(sel).first
-                if await loc.is_visible(timeout=TV_SNAPSHOT_MENU_TIMEOUT_MS):
-                    await loc.click(timeout=TV_SNAPSHOT_MENU_TIMEOUT_MS)
-                    await page.wait_for_timeout(600)
-                    clicked_camera = True
-                    notes.append(f"camera_selector={sel}")
-                    break
-            except Exception as e:
-                notes.append(f"camera_fail={sel}:{type(e).__name__}")
-
-        if not clicked_camera:
-            # Some TradingView builds expose the snapshot button only via the camera icon title or toolbar.
-            # Try a last-resort click near the top-right toolbar area, not over the chart body.
-            try:
-                await page.mouse.click(int(TV_VIEWPORT_WIDTH * 0.885), int(TV_VIEWPORT_HEIGHT * 0.035))
-                await page.wait_for_timeout(700)
-                notes.append("camera_fallback_top_right_click")
-                clicked_camera = True
-            except Exception as e:
-                return False, "snapshot camera not found: " + type(e).__name__
-
-        # Prefer an actual browser download if TradingView exposes one.
-        for text in download_texts:
-            try:
-                item = page.get_by_text(text, exact=False).first
-                if await item.is_visible(timeout=TV_SNAPSHOT_MENU_TIMEOUT_MS):
-                    async with page.expect_download(timeout=TV_SNAPSHOT_TIMEOUT_MS) as dl_info:
-                        await item.click(timeout=TV_SNAPSHOT_MENU_TIMEOUT_MS)
-                    download = await dl_info.value
-                    await download.save_as(str(out_path))
-                    if out_path.exists() and screenshot_has_chart_content(out_path):
-                        return True, "tradingview_download_image_ok; " + "; ".join(notes + [f"download_text={text}"])
-                    return False, "downloaded image failed visual validation; " + "; ".join(notes + [f"download_text={text}"])
-            except Exception as e:
-                notes.append(f"download_text_fail={text}:{type(e).__name__}")
-
-        # If the camera menu opens a new image/share page instead of direct download, try to capture that image.
-        # We do not accept it blindly: it must pass the same visual chart-content check.
-        pages_before = set(page.context.pages)
-        try:
-            await page.wait_for_timeout(1200)
-            new_pages = [pg for pg in page.context.pages if pg not in pages_before]
-            for np in new_pages:
-                try:
-                    await np.wait_for_load_state("domcontentloaded", timeout=4000)
-                    await np.screenshot(path=str(out_path), full_page=False, type="jpeg", quality=86, timeout=6000)
-                    if out_path.exists() and screenshot_has_chart_content(out_path):
-                        await np.close()
-                        return True, "tradingview_snapshot_new_page_captured; " + "; ".join(notes)
-                    await np.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        return False, "snapshot/download UI tried but no valid image download captured; " + "; ".join(notes[-8:])
-    except Exception as e:
-        return False, f"snapshot download failed: {type(e).__name__}: {e}"
-
 async def capture_and_validate(page: Page, out_path: Path, img_type: str, quality: int) -> bool:
     # Wide chart screenshot. Default v4.2 does NOT square-crop or left-crop; it keeps a landscape
     # full chart canvas so candle proportions stay natural. CHART_CLIP_WIDTH_RATIO /
@@ -725,19 +835,6 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
                     # Do not keep this screenshot/candidate; continue to next TradingView path.
                     break
                 await hover_latest_candle_column(page)
-
-                # v5: Prefer TradingView's own exported image/snapshot when available.
-                # If it fails, fall back to strict viewport screenshot validation.
-                download_ok, download_note = await try_tradingview_download_image(page, out_path)
-                if download_ok:
-                    tv_error, tv_error_note = await page_has_tradingview_symbol_error(page)
-                    if tv_error:
-                        last_validation_note = f"attempt {attempt}: downloaded snapshot rejected after screenshot: {tv_error_note}"
-                        break
-                    status = "ok_download_image" if canvas_found else "ok_download_image_visual_verified"
-                    note = f"TradingView own download/snapshot image captured and visual content check passed. {download_note}"
-                    return out_path, f"/screenshots/{filename}", status, note
-
                 verified_image = await capture_and_validate(page, out_path, img_type, 78 if img_type == "jpeg" else 0)
                 if verified_image:
                     # Re-check after screenshot; some widgets show an error modal after canvas boot.
@@ -1209,11 +1306,9 @@ async def chart(
         yahoo_interval_used=YF_INTERVALS.get(interval, "5m"),
         range_hint=range_hint,
         target_date=target_date,
-        source_chart="TradingView chart image via Browserless remote browser; v5 tries TradingView own download/snapshot first, then strict viewport screenshot fallback",
+        source_chart="TradingView visual chart screenshot via Browserless remote browser; attempts native custom range (current 09:45→now+1m capped 18:10, historical 09:45→18:10) and image-detected last-candle hover above the final candle column",
         source_data="Strict TradingView image-first capture with session-tight-fit chart-only capture; Midas/BloombergHT provide external market info; no non-chart visual fallback; quotes are secondary and non-blocking",
         tradingview_url=tv_url,
-        capture_method_used=("tradingview_download_image" if "download_image" in chart_status or "snapshot" in chart_note.lower() else ("browser_viewport_screenshot" if shot_path else "none")),
-        download_attempt_note=(chart_note if ("download_image" in chart_status or "snapshot" in chart_note.lower()) else "download-first attempted when enabled; viewport screenshot fallback may have been used"),
         screenshot_url=screenshot_url,
         screenshot_base64_png=screenshot_base64,
         chart_status=chart_status,
