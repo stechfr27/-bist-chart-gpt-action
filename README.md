@@ -1,4 +1,4 @@
-# BIST Chart GPT Action API v1.9 Speed Optimized
+# BIST Chart GPT Action API v2.0 Speed Optimized
 
 Bu proje ChatGPT Custom GPT Actions için BIST grafik servisidir.
 
@@ -26,7 +26,7 @@ https://SENIN-URL.onrender.com/health
 Beklenen sürüm:
 
 ```json
-{"version":"1.9.0-current-speed-optimized"}
+{"version":"2.0.0-current-ultrafast-clean"}
 ```
 
 ## Warmup
@@ -72,3 +72,10 @@ Sonra Custom GPT > Configure > Actions > Create new action içine schema'yı yap
 
 Ücretsiz kaynaklarda BIST intraday veri gecikmeli, sınırlı veya dönemsel olarak eksik olabilir.
 Derinlik, AKD/BOFA, karanlık oda ve emir defteri için aracı kurum ekranı gerekir.
+
+
+## v2.0 speed-clean notes
+- Current mode now uses a compact JPEG screenshot for faster GPT vision transfer.
+- Current mode skips Yahoo/Stooq OHLC and uses TradingView + Midas/BloombergHT fast quote checks.
+- Quote context is compacted to avoid bloated API responses.
+- Use balanced mode only for dated or historical OHLC fallback attempts.

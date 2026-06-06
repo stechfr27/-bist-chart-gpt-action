@@ -18,15 +18,15 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "1.9.0-current-speed-optimized"
+APP_VERSION = "2.0.0-current-ultrafast-clean"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
-QUOTE_CACHE_TTL_SECONDS = int(os.getenv("QUOTE_CACHE_TTL_SECONDS", "120"))
+QUOTE_CACHE_TTL_SECONDS = int(os.getenv("QUOTE_CACHE_TTL_SECONDS", "180"))
 TRADINGVIEW_COOKIE = os.getenv("TRADINGVIEW_COOKIE", "").strip()
-TV_WAIT_CURRENT_MS = int(os.getenv("TV_WAIT_CURRENT_MS", "6500"))
+TV_WAIT_CURRENT_MS = int(os.getenv("TV_WAIT_CURRENT_MS", "2800"))
 TV_WAIT_BALANCED_MS = int(os.getenv("TV_WAIT_BALANCED_MS", "12000"))
-TV_CANVAS_WAIT_CURRENT_MS = int(os.getenv("TV_CANVAS_WAIT_CURRENT_MS", "3500"))
+TV_CANVAS_WAIT_CURRENT_MS = int(os.getenv("TV_CANVAS_WAIT_CURRENT_MS", "1400"))
 TV_CANVAS_WAIT_BALANCED_MS = int(os.getenv("TV_CANVAS_WAIT_BALANCED_MS", "9000"))
 HTTP_TIMEOUT_CURRENT = int(os.getenv("HTTP_TIMEOUT_CURRENT", "5"))
 HTTP_TIMEOUT_BALANCED = int(os.getenv("HTTP_TIMEOUT_BALANCED", "10"))
@@ -139,6 +139,7 @@ class ChartResponse(BaseModel):
     official_reference: dict = Field(default_factory=dict)
     data_status: str
     data_note: str
+    performance_note: str = ""
     captured_at_utc: str
 
 app = FastAPI(
@@ -230,7 +231,9 @@ async def click_soft_popups(page: Page):
             pass
 
 async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str = "current") -> tuple[Optional[Path], Optional[str], str, str]:
-    filename = f"{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}.png"
+    img_type = "jpeg" if mode in {"current", "fast"} else "png"
+    ext = "jpg" if img_type == "jpeg" else "png"
+    filename = f"{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}.{ext}"
     out_path = SCREENSHOT_DIR / filename
     chart_status = "ok"
     chart_note = "TradingView grafiği yüklendi ve screenshot alındı."
@@ -239,7 +242,7 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
     try:
         page = await ctx.new_page()
         await install_fast_routes(page)
-        page.set_default_timeout(12000 if mode in {"current", "fast"} else 18000)
+        page.set_default_timeout(9000 if mode in {"current", "fast"} else 18000)
         page.set_default_navigation_timeout(60000 if mode in {"current", "fast"} else 90000)
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000 if mode in {"current", "fast"} else 90000)
@@ -259,14 +262,21 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
         if not canvas_found and chart_status == "ok":
             chart_status = "partial_no_canvas_detected"
             chart_note = "TradingView sayfası açıldı ve viewport screenshot alındı; canvas/legend otomatik doğrulaması kesinleşmedi. Görsel yine analiz için kullanılabilir."
-        await page.screenshot(path=str(out_path), full_page=False, type="png")
+        # Current mode: smaller JPEG viewport screenshot is much faster and enough for GPT vision.
+        if img_type == "jpeg":
+            await page.screenshot(path=str(out_path), full_page=False, type="jpeg", quality=82, timeout=22000)
+        else:
+            await page.screenshot(path=str(out_path), full_page=False, type="png", timeout=30000)
         return out_path, f"/screenshots/{filename}", chart_status, chart_note
     except Exception as e:
         chart_status = "chart_failed_data_only"
         chart_note = f"TradingView screenshot başarısız; veri katmanları yine döndürüldü. Hata: {type(e).__name__}: {e}"
         try:
             if page:
-                await page.screenshot(path=str(out_path), full_page=False, type="png")
+                if img_type == "jpeg":
+                    await page.screenshot(path=str(out_path), full_page=False, type="jpeg", quality=75, timeout=12000)
+                else:
+                    await page.screenshot(path=str(out_path), full_page=False, type="png", timeout=20000)
                 return out_path, f"/screenshots/{filename}", "partial_screenshot_recovered", chart_note
         except Exception:
             pass
@@ -407,11 +417,21 @@ def clean_html_text(html: str) -> list[str]:
     lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
     return [x for x in lines if x]
 
-def extract_context_text(html: str, symbol: str) -> str:
+def extract_context_text(html: str, symbol: str, limit: int = 900) -> str:
     lines = clean_html_text(html)
-    hits = [x for x in lines if symbol.upper() in x.upper() or "BIST" in x.upper() or "ALIŞ" in x.upper() or "SATIŞ" in x.upper() or "HACİM" in x.upper()]
-    joined = " | ".join(hits[:28])
-    return joined[:1600]
+    hits = [x for x in lines if symbol.upper() in x.upper() or "BIST" in x.upper() or "ALIŞ" in x.upper() or "SATIŞ" in x.upper() or "HACİM" in x.upper() or "SON" in x.upper()]
+    # Keep only compact, analysis-useful context. Long company biographies slow GPT and bloat responses.
+    cleaned = []
+    seen = set()
+    for h in hits:
+        h = h.strip()
+        if len(h) < 2 or h in seen:
+            continue
+        seen.add(h)
+        cleaned.append(h)
+        if len(" | ".join(cleaned)) >= limit:
+            break
+    return " | ".join(cleaned)[:limit]
 
 def make_quote_sources(symbol: str, mode: str = "balanced") -> list[tuple[str, str]]:
     midas_symbol = symbol.lower()
@@ -445,7 +465,8 @@ def fetch_public_quotes(symbol: str, mode: str = "balanced") -> tuple[list[dict]
         if err:
             entry["note"] = repair_mojibake(err)
         else:
-            entry["context"] = repair_mojibake(extract_context_text(html, symbol))
+            ctx_limit = 520 if mode in {"current", "fast"} else 1200
+            entry["context"] = repair_mojibake(extract_context_text(html, symbol, ctx_limit))
             if name.startswith("Midas"):
                 entry["note"] = "Midas canlı borsa sayfası BIST kaynaklı en az 15 dakika gecikmeli olabilir; ek fiyat teyidi olarak kullanılır."
             if name.startswith("BloombergHT"):
@@ -454,7 +475,7 @@ def fetch_public_quotes(symbol: str, mode: str = "balanced") -> tuple[list[dict]
                 entry["note"] = "Investing sayfası fiyat/yüzde ve haber bağlamı için ek kaynak olarak kullanılır."
         snapshots.append(entry)
     official = {
-        "source": "Borsa Istanbul",
+        "source": "Borsa İstanbul",
         "status": "reference_only",
         "url": "https://www.borsaistanbul.com/",
         "note": "Resmi kaynak/duyuru/günlük bülten referansı. Ücretsiz canlı 1dk/5dk mum API kaynağı gibi kullanılmaz.",
@@ -533,5 +554,6 @@ async def chart(
         official_reference=official_reference,
         data_status=data_status if records else ("public_quote_fallback" if quote_snapshots else data_status),
         data_note=final_note,
+        performance_note=("current mode: TradingView JPEG screenshot + Midas/BloombergHT only; Yahoo/Stooq skipped for speed" if mode in {"current", "fast"} else "balanced mode: slower OHLC fallback enabled"),
         captured_at_utc=datetime.now(timezone.utc).isoformat(),
     )
