@@ -19,7 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "5.1.0-custom-range-last-candle"
+APP_VERSION = "5.2.0-range-core-stabilized"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -36,12 +36,12 @@ HTTP_TIMEOUT_CURRENT = int(os.getenv("HTTP_TIMEOUT_CURRENT", "2"))
 HTTP_TIMEOUT_BALANCED = int(os.getenv("HTTP_TIMEOUT_BALANCED", "7"))
 AUTO_CLEAR_SCREENSHOTS = os.getenv("AUTO_CLEAR_SCREENSHOTS", "true").lower() in {"1", "true", "yes", "on"}
 SCREENSHOT_KEEP_LAST = int(os.getenv("SCREENSHOT_KEEP_LAST", "0"))
-TV_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_CURRENT_HARD_TIMEOUT_SECONDS", "65"))
+TV_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_CURRENT_HARD_TIMEOUT_SECONDS", "55"))
 TV_BALANCED_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_BALANCED_HARD_TIMEOUT_SECONDS", "115"))
 QUOTE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("QUOTE_CURRENT_HARD_TIMEOUT_SECONDS", "2"))
-TOTAL_CHART_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_CHART_HARD_TIMEOUT_SECONDS", "70"))
-TV_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_SAFE_CURRENT_HARD_TIMEOUT_SECONDS", "90"))
-TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS", "95"))
+TOTAL_CHART_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_CHART_HARD_TIMEOUT_SECONDS", "58"))
+TV_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_SAFE_CURRENT_HARD_TIMEOUT_SECONDS", "75"))
+TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS", "80"))
 TOTAL_BALANCED_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_BALANCED_HARD_TIMEOUT_SECONDS", "115"))
 USE_WIDGET_FOR_CURRENT = os.getenv("USE_WIDGET_FOR_CURRENT", "true").lower() in {"1", "true", "yes", "on"}
 SESSION_ZOOM_STEPS = int(os.getenv("SESSION_ZOOM_STEPS", "8"))
@@ -58,6 +58,8 @@ BIST_SESSION_START = os.getenv("BIST_SESSION_START", "09:45")
 BIST_SESSION_END = os.getenv("BIST_SESSION_END", "18:10")
 BIST_SESSION_STRICT_NOTE = "BIST 5m session target is 09:45-18:10. For current requests, end target is current Istanbul time +1 minute, capped at 18:10. The system must not claim exact full-session coverage unless the x-axis visually shows that band."
 TV_USE_CUSTOM_RANGE = os.getenv("TV_USE_CUSTOM_RANGE", "true").lower() in {"1", "true", "yes", "on"}
+TV_CUSTOM_RANGE_CORE = os.getenv("TV_CUSTOM_RANGE_CORE", "true").lower() in {"1", "true", "yes", "on"}
+TV_CUSTOM_RANGE_MAX_SECONDS = int(os.getenv("TV_CUSTOM_RANGE_MAX_SECONDS", "16"))
 TV_CUSTOM_RANGE_START = os.getenv("TV_CUSTOM_RANGE_START", BIST_SESSION_START)
 TV_CUSTOM_RANGE_END = os.getenv("TV_CUSTOM_RANGE_END", BIST_SESSION_END)
 TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES = int(os.getenv("TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES", "1"))
@@ -68,7 +70,7 @@ TV_IMAGE_DETECT_LAST_CANDLE = os.getenv("TV_IMAGE_DETECT_LAST_CANDLE", "true").l
 TV_FORCE_FULLSCREEN = os.getenv("TV_FORCE_FULLSCREEN", "true").lower() in {"1", "true", "yes", "on"}
 TV_FULLSCREEN_SHORTCUT = os.getenv("TV_FULLSCREEN_SHORTCUT", "Shift+F")
 TV_HOVER_LAST_CANDLE = os.getenv("TV_HOVER_LAST_CANDLE", "true").lower() in {"1", "true", "yes", "on"}
-TV_CLICK_LAST_CANDLE_COLUMN = os.getenv("TV_CLICK_LAST_CANDLE_COLUMN", "true").lower() in {"1", "true", "yes", "on"}
+TV_CLICK_LAST_CANDLE_COLUMN = os.getenv("TV_CLICK_LAST_CANDLE_COLUMN", "false").lower() in {"1", "true", "yes", "on"}
 TV_LAST_CANDLE_X_RATIO = float(os.getenv("TV_LAST_CANDLE_X_RATIO", "0.965"))
 TV_LAST_CANDLE_Y_RATIO = float(os.getenv("TV_LAST_CANDLE_Y_RATIO", "0.38"))
 
@@ -209,7 +211,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END, "strict_note": BIST_SESSION_STRICT_NOTE}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO, "image_detect_last_candle": TV_IMAGE_DETECT_LAST_CANDLE}, "custom_range": {"enabled": TV_USE_CUSTOM_RANGE, "session_start": TV_CUSTOM_RANGE_START, "session_end": TV_CUSTOM_RANGE_END, "current_plus_minutes": TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES}}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END, "strict_note": BIST_SESSION_STRICT_NOTE}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO, "image_detect_last_candle": TV_IMAGE_DETECT_LAST_CANDLE}, "custom_range": {"enabled": TV_USE_CUSTOM_RANGE, "core": TV_CUSTOM_RANGE_CORE, "max_seconds": TV_CUSTOM_RANGE_MAX_SECONDS, "session_start": TV_CUSTOM_RANGE_START, "session_end": TV_CUSTOM_RANGE_END, "current_plus_minutes": TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES}}
 
 @app.get("/warmup")
 async def warmup():
@@ -602,7 +604,12 @@ async def apply_session_view_controls(page: Page, view: str, target_date: Option
             pass
     # Try the site's own custom range selector first: current = 09:45 -> now+1m (max 18:10),
     # target_date = 09:45 -> 18:10. This is best-effort because TradingView changes UI selectors.
-    custom_note = await try_tradingview_custom_date_range(page, target_date, view)
+    try:
+        custom_note = await asyncio.wait_for(try_tradingview_custom_date_range(page, target_date, view), timeout=TV_CUSTOM_RANGE_MAX_SECONDS)
+    except asyncio.TimeoutError:
+        custom_note = f"custom range core attempt timeboxed at {TV_CUSTOM_RANGE_MAX_SECONDS}s"
+    except Exception as e:
+        custom_note = f"custom range core attempt failed: {type(e).__name__}: {e}"
     # TradingView range=1D often means "last 24h", which can show the previous session too.
     # For BIST intraday analysis the user needs the latest regular session (open->close)
     # readable, not two days compressed. Zoom around the right side of the chart so the
@@ -805,7 +812,17 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
     ctx = await BROWSER.get_context()
     page = None
     try:
-        page = await ctx.new_page()
+        try:
+            page = await ctx.new_page()
+        except Exception as first_page_error:
+            # Browserless free sessions can close the context after a timebox.
+            # Reset once and reopen so custom-range remains a core path instead of poisoning later requests.
+            if "closed" in str(first_page_error).lower() or "target" in str(first_page_error).lower():
+                await BROWSER.reset()
+                ctx = await BROWSER.get_context()
+                page = await ctx.new_page()
+            else:
+                raise
         await install_fast_routes(page)
         page.set_default_timeout(8000 if mode == "safe_current" else (5000 if mode in {"current", "fast"} else 12000))
         page.set_default_navigation_timeout(45000 if mode == "safe_current" else (28000 if mode in {"current", "fast"} else 55000))
@@ -967,7 +984,7 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
                 return out_path, shot_path, "ok_tradingview_widgetembed", note + " | Exact TradingView chart path: official widgetembed; session-zoom view attempts to show the latest BIST session open-to-close with readable 5m candles and chart area; external quote fields provide price/stat context."
 
         # 3) Full TradingView chart, most complete but heaviest.
-        full_budget = (55 if (mode in {"current", "fast"} and view in {"session", "full_day", "day"}) else (38 if mode in {"current", "fast"} else (70 if mode == "safe_current" else hard_timeout)))
+        full_budget = (48 if (mode in {"current", "fast"} and view in {"session", "full_day", "day"}) else (34 if mode in {"current", "fast"} else (64 if mode == "safe_current" else hard_timeout)))
         out_path, shot_path, status, note = await _try_with_budget(
             _screenshot_single_url(url, symbol, interval, mode, "full", view, target_date),
             full_budget,
@@ -1306,7 +1323,7 @@ async def chart(
         yahoo_interval_used=YF_INTERVALS.get(interval, "5m"),
         range_hint=range_hint,
         target_date=target_date,
-        source_chart="TradingView visual chart screenshot via Browserless remote browser; attempts native custom range (current 09:45→now+1m capped 18:10, historical 09:45→18:10) and image-detected last-candle hover above the final candle column",
+        source_chart="TradingView visual chart screenshot via Browserless remote browser; uses native custom range as a core target (current 09:45→now+1m capped 18:10, historical 09:45→18:10) and image-detected last-candle hover above the final candle column",
         source_data="Strict TradingView image-first capture with session-tight-fit chart-only capture; Midas/BloombergHT provide external market info; no non-chart visual fallback; quotes are secondary and non-blocking",
         tradingview_url=tv_url,
         screenshot_url=screenshot_url,
