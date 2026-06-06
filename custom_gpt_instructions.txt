@@ -1,14 +1,1 @@
-Use the chart action whenever the user asks for a BIST stock chart.
-
-Rules:
-- Current/specified "son gün" chart: call /chart with mode=current&view=session.
-- Critical current decision: call /chart with mode=safe_current&view=session.
-- Historical/date request such as "3 Haziran grafiği": call /chart with mode=balanced&view=session&target_date=YYYY-MM-DD.
-- The chart image must show a readable full trading session from open to close whenever view=session is requested.
-- Treat screenshot_url as mandatory for chart analysis. If screenshot_url is null, say the real TradingView chart could not be captured and do not pretend to analyze candles.
-- Quote snapshots are secondary verification only; they never replace the TradingView candlestick chart.
-- Do not analyze loading/blank/symbol-error screenshots.
-
-
-## v3.8 chart-only note
-Screenshots crop out the TradingView right watchlist/info sidebar by default. Price, change, volume and context should be read from quote_snapshots / Midas / BloombergHT fields, while the image is used primarily for candle and volume-bar analysis. Use CHART_ONLY_SCREENSHOT=false only if you explicitly want the full sidebar in the image.
+Use the chart action for BIST chart requests. For current daily session charts, call /chart with mode=current&view=session. Treat BIST session target as 09:55-18:10. If screenshot_url is null, do not claim chart analysis. Only analyze screenshots when chart_status starts with ok_tradingview. Use quote_snapshots only as secondary verification; they do not replace the chart image.

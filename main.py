@@ -19,7 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "3.8.0-chart-only-external-info"
+APP_VERSION = "4.0.0-bist-session-timebox"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -51,6 +51,11 @@ SESSION_ZOOM_Y_RATIO = float(os.getenv("SESSION_ZOOM_Y_RATIO", "0.58"))
 CHART_ONLY_SCREENSHOT = os.getenv("CHART_ONLY_SCREENSHOT", "true").lower() in {"1", "true", "yes", "on"}
 CHART_CLIP_WIDTH_RATIO = float(os.getenv("CHART_CLIP_WIDTH_RATIO", "0.78"))
 CHART_CLIP_HEIGHT_RATIO = float(os.getenv("CHART_CLIP_HEIGHT_RATIO", "0.985"))
+# For BIST current/session screenshots, crop out older sessions on the left so the latest trading day is wider.
+# 0.0 = no left crop. Typical values: 0.30-0.42. Default tuned from THYAO 5m tests.
+SESSION_LEFT_CROP_RATIO = float(os.getenv("SESSION_LEFT_CROP_RATIO", "0.36"))
+BIST_SESSION_START = os.getenv("BIST_SESSION_START", "09:55")
+BIST_SESSION_END = os.getenv("BIST_SESSION_END", "18:10")
 
 TV_INTERVALS = {"1m": "1", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "1h": "60", "1d": "D"}
 YF_INTERVALS = {"1m": "1m", "3m": "5m", "5m": "5m", "10m": "15m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d"}
@@ -189,7 +194,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO}}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END}}
 
 @app.get("/warmup")
 async def warmup():
@@ -473,10 +478,16 @@ async def capture_and_validate(page: Page, out_path: Path, img_type: str, qualit
     # from Midas/BloombergHT quote snapshots, so GPT focuses on the candles.
     clip = None
     if CHART_ONLY_SCREENSHOT:
+        # First remove the right TradingView sidebar, then crop a tunable part of the
+        # left side where previous-session candles often remain. This keeps the latest
+        # BIST session readable while preserving the price scale on the right edge.
+        right_edge = max(900, int(TV_VIEWPORT_WIDTH * CHART_CLIP_WIDTH_RATIO))
+        left_crop = int(right_edge * SESSION_LEFT_CROP_RATIO) if SESSION_LEFT_CROP_RATIO > 0 else 0
+        left_crop = max(0, min(left_crop, right_edge - 850))
         clip = {
-            "x": 0,
+            "x": left_crop,
             "y": 0,
-            "width": max(800, int(TV_VIEWPORT_WIDTH * CHART_CLIP_WIDTH_RATIO)),
+            "width": max(800, right_edge - left_crop),
             "height": max(600, int(TV_VIEWPORT_HEIGHT * CHART_CLIP_HEIGHT_RATIO)),
         }
     if img_type == "jpeg":
@@ -886,7 +897,7 @@ def fetch_public_quotes(symbol: str, mode: str = "balanced") -> tuple[list[dict]
 
 def build_ohlc(symbol: str, yahoo_symbol: str, interval: str, range_hint: str, target_date: Optional[str], mode: str = "balanced") :
     if mode in {"current", "safe_current"} and not target_date:
-        return [], "current_quote_only", "Current mode: speed-first current chart; slow Yahoo/Stooq OHLC calls skipped. Price verification uses public quote layers."
+        return [], "current_quote_only", f"BIST session target: {BIST_SESSION_START}-{BIST_SESSION_END}. Current mode: speed-first current chart; slow Yahoo/Stooq OHLC calls skipped. Price verification uses public quote layers."
     records, status, note = fetch_yahoo_ohlc(yahoo_symbol, interval, range_hint, target_date)
     if records:
         return records, status, note
@@ -991,7 +1002,7 @@ async def chart(
         yahoo_interval_used=YF_INTERVALS.get(interval, "5m"),
         range_hint=range_hint,
         target_date=target_date,
-        source_chart="TradingView visual chart screenshot via Browserless remote browser if configured, otherwise local Playwright; session-tight-fit viewport focuses the latest BIST trading session open-to-close while the right-side watchlist/info panel is excluded from the screenshot",
+        source_chart="TradingView visual chart screenshot via Browserless remote browser if configured, otherwise local Playwright; latest-session crop excludes the right info panel and trims older sessions on the left for a clearer current-day view",
         source_data="Strict TradingView image-first capture with session-tight-fit chart-only capture; Midas/BloombergHT provide external market info; no non-chart visual fallback; quotes are secondary and non-blocking",
         tradingview_url=tv_url,
         screenshot_url=screenshot_url,
