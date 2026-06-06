@@ -19,15 +19,15 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "3.5.0-session-full-day-view"
+APP_VERSION = "3.6.0-session-zoom-fit"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
 QUOTE_CACHE_TTL_SECONDS = int(os.getenv("QUOTE_CACHE_TTL_SECONDS", "180"))
 TRADINGVIEW_COOKIE = os.getenv("TRADINGVIEW_COOKIE", "").strip()
 BROWSERLESS_WS_ENDPOINT = os.getenv("BROWSERLESS_WS_ENDPOINT", "").strip()
-TV_VIEWPORT_WIDTH = int(os.getenv("TV_VIEWPORT_WIDTH", "1600"))
-TV_VIEWPORT_HEIGHT = int(os.getenv("TV_VIEWPORT_HEIGHT", "1000"))
+TV_VIEWPORT_WIDTH = int(os.getenv("TV_VIEWPORT_WIDTH", "1920"))
+TV_VIEWPORT_HEIGHT = int(os.getenv("TV_VIEWPORT_HEIGHT", "1080"))
 TV_WAIT_CURRENT_MS = int(os.getenv("TV_WAIT_CURRENT_MS", "1200"))
 TV_WAIT_BALANCED_MS = int(os.getenv("TV_WAIT_BALANCED_MS", "9000"))
 TV_CANVAS_WAIT_CURRENT_MS = int(os.getenv("TV_CANVAS_WAIT_CURRENT_MS", "1200"))
@@ -44,6 +44,10 @@ TV_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_SAFE_CURRENT_HARD_TIMEO
 TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS", "95"))
 TOTAL_BALANCED_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_BALANCED_HARD_TIMEOUT_SECONDS", "115"))
 USE_WIDGET_FOR_CURRENT = os.getenv("USE_WIDGET_FOR_CURRENT", "true").lower() in {"1", "true", "yes", "on"}
+SESSION_ZOOM_STEPS = int(os.getenv("SESSION_ZOOM_STEPS", "5"))
+SESSION_ZOOM_WHEEL_DELTA = int(os.getenv("SESSION_ZOOM_WHEEL_DELTA", "-520"))
+SESSION_ZOOM_X_RATIO = float(os.getenv("SESSION_ZOOM_X_RATIO", "0.70"))
+SESSION_ZOOM_Y_RATIO = float(os.getenv("SESSION_ZOOM_Y_RATIO", "0.55"))
 
 TV_INTERVALS = {"1m": "1", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "1h": "60", "1d": "D"}
 YF_INTERVALS = {"1m": "1m", "3m": "5m", "5m": "5m", "10m": "15m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d"}
@@ -373,10 +377,23 @@ async def apply_session_view_controls(page: Page, view: str, target_date: Option
             break
         except Exception:
             pass
-    # Tighten horizontal density so the whole day is readable, not over-zoomed.
+    # TradingView range=1D often means "last 24h", which can show the previous session too.
+    # For BIST intraday analysis the user needs the latest regular session (open->close)
+    # readable, not two days compressed. Zoom around the right side of the chart so the
+    # newest session expands while the right info panel remains visible.
     try:
-        await page.keyboard.press("Alt+R")
-        await page.wait_for_timeout(300)
+        await page.keyboard.press("End")
+        await page.wait_for_timeout(250)
+    except Exception:
+        pass
+    try:
+        x = int(TV_VIEWPORT_WIDTH * SESSION_ZOOM_X_RATIO)
+        y = int(TV_VIEWPORT_HEIGHT * SESSION_ZOOM_Y_RATIO)
+        await page.mouse.move(x, y)
+        for _ in range(max(0, SESSION_ZOOM_STEPS)):
+            await page.mouse.wheel(0, SESSION_ZOOM_WHEEL_DELTA)
+            await page.wait_for_timeout(220)
+        await page.wait_for_timeout(700)
     except Exception:
         pass
 
@@ -603,7 +620,7 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
             )
             notes.append(note)
             if out_path and shot_path:
-                return out_path, shot_path, "ok_tradingview_local_widget", note + " | Exact TradingView chart path: local widget; session/full-day view attempts to fit the whole day and include right-side chart/info area when available."
+                return out_path, shot_path, "ok_tradingview_local_widget", note + " | Exact TradingView chart path: local widget; session-zoom view attempts to show the latest BIST session open-to-close with readable 5m candles and right-side chart/info area when available."
 
         # 2) Official lightweight widgetembed.
         if mode in {"current", "fast", "safe_current"} and USE_WIDGET_FOR_CURRENT and view not in {"session", "full_day", "day"}:
@@ -617,7 +634,7 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
             )
             notes.append(note)
             if out_path and shot_path:
-                return out_path, shot_path, "ok_tradingview_widgetembed", note + " | Exact TradingView chart path: official widgetembed; session/full-day view attempts to fit the whole day and include right-side chart/info area when available."
+                return out_path, shot_path, "ok_tradingview_widgetembed", note + " | Exact TradingView chart path: official widgetembed; session-zoom view attempts to show the latest BIST session open-to-close with readable 5m candles and right-side chart/info area when available."
 
         # 3) Full TradingView chart, most complete but heaviest.
         full_budget = (55 if (mode in {"current", "fast"} and view in {"session", "full_day", "day"}) else (38 if mode in {"current", "fast"} else (70 if mode == "safe_current" else hard_timeout)))
@@ -629,7 +646,7 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
         )
         notes.append(note)
         if out_path and shot_path:
-            return out_path, shot_path, "ok_tradingview_full_chart", " | ".join(notes + ["Exact TradingView chart path: full chart; session view tries to fit the full trading day from open to close and includes right-side symbol info/statistics panel when TradingView renders it."])
+            return out_path, shot_path, "ok_tradingview_full_chart", " | ".join(notes + ["Exact TradingView chart path: full chart; session_zoom tries to focus the latest BIST session open-to-close, expands 5m candles, and keeps the right-side symbol info/statistics panel visible when TradingView renders it."])
 
         return None, None, "strict_tradingview_image_failed", " | ".join(notes + ["No verified TradingView chart image returned. No public quote-page fallback was used, because user requested the actual chart screenshot only."])
 
@@ -901,7 +918,7 @@ async def chart(
     include_base64: bool = Query(False, description="true ise screenshot base64 döner; genelde false kalsın."),
     mode: str = Query("current", description="current, safe_current, fast veya balanced. current guncel grafik icin budgeted graph-first 65sn moddur; safe_current 90sn daha guvenlidir; balanced tarihsel/OHLC icin detaylidir."),
     auto_clear: bool = Query(True, description="true ise yeni grafik isteginden once eski screenshot dosyalarini siler."),
-    view: str = Query("session", description="session/full_day/day: acilistan kapanisa son gunu ekrana sigdirir; auto: eski davranis."),
+    view: str = Query("session", description="session/full_day/day: son BIST seansini zoom-fit yapar; 5dk mumlari daha okunur hale getirir; auto: eski davranis."),
 ):
     clean_symbol = normalize_symbol(symbol)
     if interval not in TV_INTERVALS:
@@ -959,8 +976,8 @@ async def chart(
         yahoo_interval_used=YF_INTERVALS.get(interval, "5m"),
         range_hint=range_hint,
         target_date=target_date,
-        source_chart="TradingView visual chart screenshot via Browserless remote browser if configured, otherwise local Playwright; session/full-day viewport captures the full trading day plus right-side symbol info panel",
-        source_data="Strict TradingView image-first capture with right-sidebar market info visible; no non-chart visual fallback; quotes are secondary and non-blocking",
+        source_chart="TradingView visual chart screenshot via Browserless remote browser if configured, otherwise local Playwright; session-zoom viewport focuses the latest trading day open-to-close plus right-side symbol info panel",
+        source_data="Strict TradingView image-first capture with session-zoom and right-sidebar market info visible; no non-chart visual fallback; quotes are secondary and non-blocking",
         tradingview_url=tv_url,
         screenshot_url=screenshot_url,
         screenshot_base64_png=screenshot_base64,

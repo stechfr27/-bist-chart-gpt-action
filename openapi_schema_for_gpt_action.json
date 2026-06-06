@@ -128,7 +128,7 @@
                 "auto"
               ]
             },
-            "description": "session/full_day/day fits the full trading day from open to close on the screenshot. auto uses older behavior."
+            "description": "session/full_day/day fits the latest BIST session open-to-close from open to close on the screenshot. auto uses older behavior."
           }
         ],
         "responses": {

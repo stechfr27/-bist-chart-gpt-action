@@ -1,13 +1,13 @@
 # BIST Chart GPT Action API v3.5
 
-Strict TradingView chart screenshot service for ChatGPT Actions. This version prioritizes a clear **full-day/session view**: when the user asks for "son gün", the chart tries to show the full trading day from open to close, not an over-zoomed partial slice.
+Strict TradingView chart screenshot service for ChatGPT Actions. This version prioritizes a clear **full-day/session view**: when the user asks for "son gün", the chart tries to show the latest BIST session open-to-close from open to close, not an over-zoomed partial slice.
 
 ## New in v3.5
 
 - Default `view=session` for current chart requests.
 - Full TradingView chart is prioritized for session view so the right-side symbol info panel remains visible.
 - Adds `range=1D` and soft-clicks the TradingView `1G/1D` range control when available.
-- Wider viewport: default `1600x1000`.
+- Wider viewport: default `1920x1080`.
 - Local/widget paths are skipped in session mode because they can be cramped or show symbol errors for BIST.
 - Browserless remote browser support remains active via `BROWSERLESS_WS_ENDPOINT`.
 - Strict rule remains: loading/blank/symbol-error screenshots are rejected.
