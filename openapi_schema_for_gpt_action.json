@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BIST Chart GPT Action",
-    "version": "1.0.0",
-    "description": "BIST hisseleri için TradingView mum grafik ekran görüntüsü ve doğrulama amaçlı OHLC verisi döndürür."
+    "version": "1.1.0",
+    "description": "BIST hisseleri için TradingView mum grafik ekran görüntüsü ve Yahoo Finance OHLC doğrulama/eksik veri tamamlama verisi döndürür."
   },
   "servers": [
     {
@@ -14,17 +14,70 @@
     "/chart": {
       "get": {
         "operationId": "getBistChart",
-        "summary": "BIST hisse mum grafiği ekran görüntüsü ve OHLC verisi al",
+        "summary": "BIST hisse mum grafiği ekran görüntüsü ve Yahoo Finance OHLC verisi al",
         "parameters": [
-          {"name":"symbol","in":"query","required":true,"schema":{"type":"string"},"description":"BIST sembolü: THYAO, ASELS, TUPRS gibi"},
-          {"name":"interval","in":"query","required":false,"schema":{"type":"string","enum":["1m","3m","5m","10m","15m","30m","1h","1d"],"default":"5m"}},
-          {"name":"range_hint","in":"query","required":false,"schema":{"type":"string","default":"5d"},"description":"1d, 5d, 1mo, 3mo, 6mo, 1y gibi"},
-          {"name":"target_date","in":"query","required":false,"schema":{"type":"string"},"description":"YYYY-MM-DD formatında tarih"}
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {"type": "string"},
+            "description": "BIST sembolü: THYAO, ASELS, TUPRS gibi. .IS veya BIST: yazmana gerek yok."
+          },
+          {
+            "name": "interval",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string", "enum": ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"], "default": "5m"},
+            "description": "Grafik mum aralığı. TradingView bu interval ile açılır. Yahoo tarafında 3m -> 5m, 10m -> 15m fallback kullanabilir."
+          },
+          {
+            "name": "range_hint",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string", "default": "5d"},
+            "description": "1d, 5d, 1mo, 3mo, 6mo, 1y gibi dönem niyeti. Yahoo veri çekiminde kullanılır."
+          },
+          {
+            "name": "target_date",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string"},
+            "description": "YYYY-MM-DD formatında tarih. Örn: 2026-06-04. Intraday veri yoksa günlük OHLC fallback dönebilir."
+          },
+          {
+            "name": "include_base64",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "boolean", "default": false},
+            "description": "true olursa screenshot_base64_png de döner. Normalde false kalsın; screenshot_url daha temizdir."
+          }
         ],
         "responses": {
           "200": {
-            "description": "Grafik ekran görüntüsü ve OHLC verisi",
-            "content": {"application/json": {"schema": {"type": "object"}}}
+            "description": "Grafik ekran görüntüsü URL'i ve Yahoo OHLC doğrulama verisi",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "symbol": {"type": "string"},
+                    "yahoo_symbol": {"type": "string"},
+                    "interval": {"type": "string"},
+                    "yahoo_interval_used": {"type": "string"},
+                    "range_hint": {"type": "string"},
+                    "target_date": {"type": ["string", "null"]},
+                    "tradingview_url": {"type": "string"},
+                    "screenshot_url": {"type": "string"},
+                    "screenshot_base64_png": {"type": ["string", "null"]},
+                    "ohlc_sample": {"type": "array", "items": {"type": "object"}},
+                    "ohlc_count": {"type": "integer"},
+                    "data_status": {"type": "string"},
+                    "data_note": {"type": "string"},
+                    "captured_at_utc": {"type": "string"}
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -33,7 +86,7 @@
       "get": {
         "operationId": "healthCheck",
         "summary": "Servis sağlık kontrolü",
-        "responses": {"200": {"description":"OK"}}
+        "responses": {"200": {"description": "OK"}}
       }
     }
   }

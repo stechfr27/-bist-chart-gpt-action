@@ -6,8 +6,18 @@ Amaç: Kullanıcı ChatGPT'ye “THYAO güncel 5dk grafiğini incele” veya “
 
 1. TradingView üzerinde ilgili BIST grafiğini açar.
 2. Mum grafik ekran görüntüsü alır.
-3. Yahoo Finance üzerinden doğrulama amaçlı OHLC örneği ekler.
-4. ChatGPT'ye JSON olarak döndürür.
+3. Görseli `screenshot_url` olarak döndürür.
+4. Yahoo Finance üzerinden `.IS` formatıyla doğrulama/eksik veri tamamlama amaçlı OHLC ve hacim örneği ekler.
+5. ChatGPT'ye JSON olarak döndürür.
+
+## v1.1 güncellemesi
+
+- Yahoo Finance sembol formatı kesin olarak `THYAO.IS`, `ASELS.IS`, `TUPRS.IS` mantığına alındı.
+- Yahoo veri boş gelirse alternatif `download` ve `Ticker.history` fallback denemeleri eklendi.
+- 3m ve 10m gibi Yahoo tarafından desteklenmeyen aralıklar otomatik en yakın güvenli intervale çevrilir.
+- `screenshot_base64_png` varsayılan olarak kapatıldı; cevap şişmesin diye `screenshot_url` döner.
+- `include_base64=true` verilirse base64 görüntü yine alınabilir.
+- `data_status`, `ohlc_count`, `yahoo_symbol`, `yahoo_interval_used` alanları eklendi.
 
 ## Dosyalar
 
@@ -20,20 +30,35 @@ Amaç: Kullanıcı ChatGPT'ye “THYAO güncel 5dk grafiğini incele” veya “
 
 ## Deploy
 
-1. GitHub'da yeni repo aç.
-2. Bu dosyaları yükle.
-3. Render veya Docker destekli başka bir bulut servisine deploy et.
-4. Deploy URL'ni al.
-5. `openapi_schema_for_gpt_action.json` içindeki `https://YOUR-DEPLOYED-URL.onrender.com` kısmını kendi URL'inle değiştir.
-6. Custom GPT oluştururken Actions bölümüne bu şemayı yapıştır.
-7. Instructions kısmına `custom_gpt_instructions.txt` içeriğini ekle.
+1. GitHub'daki eski dosyaların üstüne bu yeni dosyaları yükle.
+2. Render otomatik deploy açıksa kendisi yeniden deploy eder.
+3. Otomatik deploy kapalıysa Render panelinde `Manual Deploy > Deploy latest commit` yap.
+4. Deploy bitince health testini aç:
 
-## Test
+`https://SENIN-URL.onrender.com/health`
 
-Tarayıcıdan:
+Beklenen:
 
-`https://SENIN-URL/chart?symbol=THYAO&interval=5m&range_hint=5d`
+`{"ok": true, "service": "bist-chart-gpt-action", "version": "1.1.0-yahoo-fallback-fix"}`
+
+## Test linkleri
+
+Güncel 5dk THYAO:
+
+`https://SENIN-URL.onrender.com/chart?symbol=THYAO&interval=5m&range_hint=5d`
+
+Base64 de istiyorsan:
+
+`https://SENIN-URL.onrender.com/chart?symbol=THYAO&interval=5m&range_hint=5d&include_base64=true`
+
+Belirli tarih:
+
+`https://SENIN-URL.onrender.com/chart?symbol=THYAO&interval=5m&target_date=2026-06-04`
+
+3 aylık günlük:
+
+`https://SENIN-URL.onrender.com/chart?symbol=ASELS&interval=1d&range_hint=3mo`
 
 ## Önemli not
 
-TradingView ekran görüntüsü görsel kaynak; Yahoo Finance verisi doğrulama amaçlıdır. BIST intraday verileri ücretsiz kaynaklarda gecikmeli veya kısıtlı olabilir. Kesin işlem öncesi aracı kurum ekranı ile teyit gerekir.
+TradingView ekran görüntüsü görsel kaynak; Yahoo Finance verisi doğrulama ve eksik veri tamamlama amaçlıdır. BIST intraday verileri ücretsiz kaynaklarda gecikmeli veya kısıtlı olabilir. Kesin işlem öncesi aracı kurum ekranı ile teyit gerekir.
