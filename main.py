@@ -19,13 +19,15 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "3.3.0-tv-error-reject-full-fallback"
+APP_VERSION = "3.5.0-session-full-day-view"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
 QUOTE_CACHE_TTL_SECONDS = int(os.getenv("QUOTE_CACHE_TTL_SECONDS", "180"))
 TRADINGVIEW_COOKIE = os.getenv("TRADINGVIEW_COOKIE", "").strip()
 BROWSERLESS_WS_ENDPOINT = os.getenv("BROWSERLESS_WS_ENDPOINT", "").strip()
+TV_VIEWPORT_WIDTH = int(os.getenv("TV_VIEWPORT_WIDTH", "1600"))
+TV_VIEWPORT_HEIGHT = int(os.getenv("TV_VIEWPORT_HEIGHT", "1000"))
 TV_WAIT_CURRENT_MS = int(os.getenv("TV_WAIT_CURRENT_MS", "1200"))
 TV_WAIT_BALANCED_MS = int(os.getenv("TV_WAIT_BALANCED_MS", "9000"))
 TV_CANVAS_WAIT_CURRENT_MS = int(os.getenv("TV_CANVAS_WAIT_CURRENT_MS", "1200"))
@@ -107,7 +109,7 @@ class BrowserManager:
                 )
 
             self._context = await self._browser.new_context(
-                viewport={"width": 1280, "height": 760},
+                viewport={"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT},
                 device_scale_factor=1,
                 locale="tr-TR",
                 timezone_id="Europe/Istanbul",
@@ -180,7 +182,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback"}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}}
 
 @app.get("/warmup")
 async def warmup():
@@ -201,6 +203,7 @@ async def warmup():
             "browser_started_at": BROWSER.started_at,
             "warmup_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "browser_only",
             "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT),
+            "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT},
             "note": "Browser context is ready. TradingView is intentionally not loaded during warmup; use /chart to test real chart capture."
         }
     except Exception as e:
@@ -219,22 +222,38 @@ def normalize_symbol(symbol: str) -> str:
 def make_yahoo_symbol(symbol: str) -> str:
     return f"{normalize_symbol(symbol)}.IS"
 
-def make_tv_url(symbol: str, interval: str) -> str:
-    return f"https://tr.tradingview.com/chart/?symbol=BIST:{symbol}&interval={TV_INTERVALS.get(interval, '5')}"
+def make_tv_url(symbol: str, interval: str, view: str = "session", target_date: Optional[str] = None) -> str:
+    tv_interval = TV_INTERVALS.get(interval, "5")
+    url = f"https://tr.tradingview.com/chart/?symbol=BIST:{symbol}&interval={tv_interval}"
+    # Range=1D tells TradingView to fit the latest full trading day/session into view.
+    # Unknown params are ignored by TradingView, so timestamp/date are best-effort for historical requests.
+    if view in {"session", "full_day", "day"} or target_date:
+        url += "&range=1D"
+    if target_date:
+        try:
+            from datetime import datetime as _dt
+            import zoneinfo as _zoneinfo
+            dt = _dt.fromisoformat(target_date).replace(hour=12, minute=0, second=0, microsecond=0, tzinfo=_zoneinfo.ZoneInfo("Europe/Istanbul"))
+            ts = int(dt.timestamp())
+            url += f"&timestamp={ts}&time={ts}"
+        except Exception:
+            pass
+    return url
 
-def make_tv_widget_url(symbol: str, interval: str) -> str:
+def make_tv_widget_url(symbol: str, interval: str, view: str = "session") -> str:
     tv_interval = TV_INTERVALS.get(interval, "5")
     # Lightweight official TradingView widget. Much faster than the full /chart app and still renders real candles.
     return (
         "https://s.tradingview.com/widgetembed/?"
         f"symbol=BIST%3A{symbol}&interval={tv_interval}&hidesidetoolbar=1&symboledit=1&saveimage=0"
-        "&toolbarbg=f1f3f6&studies=[]&theme=light&style=1&timezone=Europe%2FIstanbul"
+        + ("&range=1D" if view in {"session", "full_day", "day"} else "")
+        + "&toolbarbg=f1f3f6&studies=[]&theme=light&style=1&timezone=Europe%2FIstanbul"
         "&withdateranges=1&hideideas=1&studies_overrides={}&overrides={}&enabled_features=[]&disabled_features=[]"
         "&locale=tr"
     )
 
 
-def make_tv_local_html(symbol: str, interval: str) -> str:
+def make_tv_local_html(symbol: str, interval: str, view: str = "session") -> str:
     tv_interval = TV_INTERVALS.get(interval, "5")
     # Local minimal TradingView Advanced Chart Widget page.
     # This is usually faster and cleaner than opening the full TradingView site on Render.
@@ -261,6 +280,7 @@ def make_tv_local_html(symbol: str, interval: str) -> str:
         autosize: true,
         symbol: 'BIST:{symbol}',
         interval: '{tv_interval}',
+        range: '1D',
         timezone: 'Europe/Istanbul',
         theme: 'light',
         style: '1',
@@ -329,6 +349,36 @@ async def click_soft_popups(page: Page):
         except Exception:
             pass
 
+
+
+async def apply_session_view_controls(page: Page, view: str, target_date: Optional[str] = None):
+    """Try to force TradingView to fit one full session/day on screen.
+
+    The reliable public-control path is the bottom range button (Turkish: 1G, English: 1D).
+    Exact historical date navigation is best-effort because public TradingView URLs do not
+    consistently honor a direct date parameter in headless/browserless sessions.
+    """
+    if view not in {"session", "full_day", "day"} and not target_date:
+        return
+    # Click range buttons if visible. This is intentionally soft: failures should not break capture.
+    candidates = [
+        "button:has-text('1G')", "button:has-text('1D')",
+        "div:has-text('1G')", "div:has-text('1D')",
+        "span:has-text('1G')", "span:has-text('1D')",
+    ]
+    for sel in candidates:
+        try:
+            await page.locator(sel).last.click(timeout=700)
+            await page.wait_for_timeout(1300)
+            break
+        except Exception:
+            pass
+    # Tighten horizontal density so the whole day is readable, not over-zoomed.
+    try:
+        await page.keyboard.press("Alt+R")
+        await page.wait_for_timeout(300)
+    except Exception:
+        pass
 
 async def page_has_tradingview_symbol_error(page: Page) -> tuple[bool, str]:
     """Detect TradingView pages/widgets that loaded UI but not the requested chart.
@@ -403,7 +453,7 @@ async def capture_and_validate(page: Page, out_path: Path, img_type: str, qualit
         await page.screenshot(path=str(out_path), full_page=False, type="png", timeout=14000)
     return screenshot_has_chart_content(out_path)
 
-async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str, source_kind: str) -> tuple[Optional[Path], Optional[str], str, str]:
+async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str, source_kind: str, view: str = "session", target_date: Optional[str] = None) -> tuple[Optional[Path], Optional[str], str, str]:
     img_type = "jpeg" if mode in {"current", "fast", "safe_current"} else "png"
     ext = "jpg" if img_type == "jpeg" else "png"
     filename = f"{symbol}_{interval}_{source_kind}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}.{ext}"
@@ -417,6 +467,7 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
         page.set_default_navigation_timeout(45000 if mode == "safe_current" else (28000 if mode in {"current", "fast"} else 55000))
         await page.goto(url, wait_until="domcontentloaded", timeout=45000 if mode == "safe_current" else (28000 if mode in {"current", "fast"} else 55000))
         await click_soft_popups(page)
+        await apply_session_view_controls(page, view, target_date)
         base_wait = (2200 if mode == "safe_current" else TV_WAIT_CURRENT_MS) if mode in {"current", "fast", "safe_current"} else TV_WAIT_BALANCED_MS
         canvas_wait = (1500 if mode == "safe_current" else TV_CANVAS_WAIT_CURRENT_MS) if mode in {"current", "fast", "safe_current"} else TV_CANVAS_WAIT_BALANCED_MS
         max_attempts = 5 if mode == "safe_current" else (3 if mode in {"current", "fast"} else 5)
@@ -519,7 +570,7 @@ async def _screenshot_public_visual_fallback(symbol: str, interval: str, mode: s
                 pass
     return None, None, "chart_timeboxed_no_image", "TradingView failed and public visual fallback also failed/rejected. " + " | ".join(notes)
 
-async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str = "current") -> tuple[Optional[Path], Optional[str], str, str]:
+async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str = "current", view: str = "session", target_date: Optional[str] = None) -> tuple[Optional[Path], Optional[str], str, str]:
     """Strict TradingView-only capture.
     Goal: return the exact requested TradingView chart image, not a public quote page.
     Order:
@@ -541,44 +592,44 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
     async def _run():
         notes = []
         # 1) Local minimal TV widget HTML: fastest exact TradingView chart path.
-        if mode in {"current", "fast", "safe_current"}:
+        if mode in {"current", "fast", "safe_current"} and view not in {"session", "full_day", "day"}:
             local_budget = 24 if mode in {"current", "fast"} else 34
-            local_url = make_tv_local_html(symbol, interval)
+            local_url = make_tv_local_html(symbol, interval, view)
             out_path, shot_path, status, note = await _try_with_budget(
-                _screenshot_single_url(local_url, symbol, interval, mode, "tvlocal"),
+                _screenshot_single_url(local_url, symbol, interval, mode, "tvlocal", view, target_date),
                 local_budget,
                 "tvlocal_timeboxed",
                 f"Local TradingView widget timeboxed at {local_budget}s."
             )
             notes.append(note)
             if out_path and shot_path:
-                return out_path, shot_path, "ok_tradingview_local_widget", note + " | Exact TradingView chart path: local widget."
+                return out_path, shot_path, "ok_tradingview_local_widget", note + " | Exact TradingView chart path: local widget; session/full-day view attempts to fit the whole day and include right-side chart/info area when available."
 
         # 2) Official lightweight widgetembed.
-        if mode in {"current", "fast", "safe_current"} and USE_WIDGET_FOR_CURRENT:
+        if mode in {"current", "fast", "safe_current"} and USE_WIDGET_FOR_CURRENT and view not in {"session", "full_day", "day"}:
             widget_budget = 22 if mode in {"current", "fast"} else 30
-            widget_url = make_tv_widget_url(symbol, interval)
+            widget_url = make_tv_widget_url(symbol, interval, view)
             out_path, shot_path, status, note = await _try_with_budget(
-                _screenshot_single_url(widget_url, symbol, interval, mode, "widget"),
+                _screenshot_single_url(widget_url, symbol, interval, mode, "widget", view, target_date),
                 widget_budget,
                 "widget_timeboxed",
                 f"TradingView widgetembed timeboxed at {widget_budget}s."
             )
             notes.append(note)
             if out_path and shot_path:
-                return out_path, shot_path, "ok_tradingview_widgetembed", note + " | Exact TradingView chart path: official widgetembed."
+                return out_path, shot_path, "ok_tradingview_widgetembed", note + " | Exact TradingView chart path: official widgetembed; session/full-day view attempts to fit the whole day and include right-side chart/info area when available."
 
         # 3) Full TradingView chart, most complete but heaviest.
-        full_budget = 38 if mode in {"current", "fast"} else (56 if mode == "safe_current" else hard_timeout)
+        full_budget = (55 if (mode in {"current", "fast"} and view in {"session", "full_day", "day"}) else (38 if mode in {"current", "fast"} else (70 if mode == "safe_current" else hard_timeout)))
         out_path, shot_path, status, note = await _try_with_budget(
-            _screenshot_single_url(url, symbol, interval, mode, "full"),
+            _screenshot_single_url(url, symbol, interval, mode, "full", view, target_date),
             full_budget,
             "full_chart_timeboxed",
             f"Full TradingView chart timeboxed at {full_budget}s."
         )
         notes.append(note)
         if out_path and shot_path:
-            return out_path, shot_path, "ok_tradingview_full_chart", " | ".join(notes + ["Exact TradingView chart path: full chart."])
+            return out_path, shot_path, "ok_tradingview_full_chart", " | ".join(notes + ["Exact TradingView chart path: full chart; session view tries to fit the full trading day from open to close and includes right-side symbol info/statistics panel when TradingView renders it."])
 
         return None, None, "strict_tradingview_image_failed", " | ".join(notes + ["No verified TradingView chart image returned. No public quote-page fallback was used, because user requested the actual chart screenshot only."])
 
@@ -850,23 +901,26 @@ async def chart(
     include_base64: bool = Query(False, description="true ise screenshot base64 döner; genelde false kalsın."),
     mode: str = Query("current", description="current, safe_current, fast veya balanced. current guncel grafik icin budgeted graph-first 65sn moddur; safe_current 90sn daha guvenlidir; balanced tarihsel/OHLC icin detaylidir."),
     auto_clear: bool = Query(True, description="true ise yeni grafik isteginden once eski screenshot dosyalarini siler."),
+    view: str = Query("session", description="session/full_day/day: acilistan kapanisa son gunu ekrana sigdirir; auto: eski davranis."),
 ):
     clean_symbol = normalize_symbol(symbol)
     if interval not in TV_INTERVALS:
         raise HTTPException(status_code=400, detail=f"Geçersiz interval: {interval}. Destek: {', '.join(TV_INTERVALS.keys())}")
     if mode not in {"current", "balanced", "fast", "safe_current"}:
         raise HTTPException(status_code=400, detail="mode current, safe_current, balanced veya fast olmalı.")
+    if view not in {"session", "full_day", "day", "auto"}:
+        raise HTTPException(status_code=400, detail="view session, full_day, day veya auto olmali.")
     if target_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", target_date):
         raise HTTPException(status_code=400, detail="target_date YYYY-MM-DD formatında olmalı.")
     yahoo_symbol = make_yahoo_symbol(clean_symbol)
-    tv_url = make_tv_url(clean_symbol, interval)
+    tv_url = make_tv_url(clean_symbol, interval, view, target_date)
 
     clear_result = {"deleted": 0, "kept": 0}
     if auto_clear and AUTO_CLEAR_SCREENSHOTS:
         clear_result = clear_screenshot_files(keep_last=SCREENSHOT_KEEP_LAST)
 
     request_timeout = TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS if mode == "safe_current" else (TOTAL_BALANCED_HARD_TIMEOUT_SECONDS if mode == "balanced" else TOTAL_CHART_HARD_TIMEOUT_SECONDS)
-    screenshot_task = asyncio.create_task(screenshot_tradingview(tv_url, clean_symbol, interval, mode))
+    screenshot_task = asyncio.create_task(screenshot_tradingview(tv_url, clean_symbol, interval, mode, view, target_date))
     ohlc_task = asyncio.create_task(run_in_threadpool(build_ohlc, clean_symbol, yahoo_symbol, interval, range_hint, target_date, mode))
     quotes_task = asyncio.create_task(run_in_threadpool(fetch_public_quotes, clean_symbol, mode))
 
@@ -905,8 +959,8 @@ async def chart(
         yahoo_interval_used=YF_INTERVALS.get(interval, "5m"),
         range_hint=range_hint,
         target_date=target_date,
-        source_chart="TradingView visual chart screenshot via Browserless remote browser if configured, otherwise local Playwright",
-        source_data="Strict TradingView image-first capture; no non-chart visual fallback; quotes are secondary and non-blocking",
+        source_chart="TradingView visual chart screenshot via Browserless remote browser if configured, otherwise local Playwright; session/full-day viewport captures the full trading day plus right-side symbol info panel",
+        source_data="Strict TradingView image-first capture with right-sidebar market info visible; no non-chart visual fallback; quotes are secondary and non-blocking",
         tradingview_url=tv_url,
         screenshot_url=screenshot_url,
         screenshot_base64_png=screenshot_base64,

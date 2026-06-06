@@ -1,8 +1,8 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "BIST Chart GPT Action API v3.2 Browserless",
-    "version": "3.2.0"
+    "title": "BIST Chart GPT Action API v3.5 Session Full-Day",
+    "version": "3.5.0"
   },
   "servers": [
     {
@@ -75,7 +75,8 @@
                 "balanced",
                 "fast"
               ]
-            }
+            },
+            "description": "current for latest full-day visual, safe_current for more patient current capture, balanced for dated/range requests."
           },
           {
             "name": "range_hint",
@@ -92,7 +93,8 @@
             "required": false,
             "schema": {
               "type": "string"
-            }
+            },
+            "description": "YYYY-MM-DD. For a dated request, use mode=balanced&view=session. TradingView date navigation is best-effort; OHLC layer is used for date verification."
           },
           {
             "name": "include_base64",
@@ -111,11 +113,27 @@
               "type": "boolean",
               "default": true
             }
+          },
+          {
+            "name": "view",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "session",
+              "enum": [
+                "session",
+                "full_day",
+                "day",
+                "auto"
+              ]
+            },
+            "description": "session/full_day/day fits the full trading day from open to close on the screenshot. auto uses older behavior."
           }
         ],
         "responses": {
           "200": {
-            "description": "Strict TradingView chart response"
+            "description": "Strict TradingView session/full-day chart response"
           }
         }
       }

@@ -1,15 +1,16 @@
-# BIST Chart GPT Action API v3.2
+# BIST Chart GPT Action API v3.5
 
-Strict TradingView chart screenshot service for ChatGPT Actions.
+Strict TradingView chart screenshot service for ChatGPT Actions. This version prioritizes a clear **full-day/session view**: when the user asks for "son gün", the chart tries to show the full trading day from open to close, not an over-zoomed partial slice.
 
-## New in v3.2
+## New in v3.5
 
-- Optional Browserless remote browser support.
-- Set `BROWSERLESS_WS_ENDPOINT` as a secret environment variable.
-- If configured, the API uses Browserless Chrome via Playwright CDP.
-- If not configured, it falls back to local Chromium.
-- `/warmup` only starts the browser/context; it does not load TradingView.
-- `/chart` remains strict: no loading/blank screenshot and no non-chart visual fallback.
+- Default `view=session` for current chart requests.
+- Full TradingView chart is prioritized for session view so the right-side symbol info panel remains visible.
+- Adds `range=1D` and soft-clicks the TradingView `1G/1D` range control when available.
+- Wider viewport: default `1600x1000`.
+- Local/widget paths are skipped in session mode because they can be cramped or show symbol errors for BIST.
+- Browserless remote browser support remains active via `BROWSERLESS_WS_ENDPOINT`.
+- Strict rule remains: loading/blank/symbol-error screenshots are rejected.
 
 ## Required env vars
 
@@ -19,23 +20,25 @@ PYTHONUNBUFFERED=1
 BROWSERLESS_WS_ENDPOINT=wss://chrome.browserless.io?token=YOUR_TOKEN
 ```
 
-Do not put the Browserless token in GitHub files. Add it only in Render/Northflank environment variables or secrets.
+Optional viewport override:
+
+```text
+TV_VIEWPORT_WIDTH=1600
+TV_VIEWPORT_HEIGHT=1000
+```
 
 ## Test order
 
 ```text
 /health
 /warmup
-/chart?symbol=THYAO&interval=5m&mode=current
+/chart?symbol=THYAO&interval=5m&mode=current&view=session
 ```
 
-A successful Browserless setup should show:
+For a dated request:
 
-```json
-{
-  "browserless_configured": true,
-  "browser_mode": "browserless_remote"
-}
+```text
+/chart?symbol=THYAO&interval=5m&target_date=2026-06-03&mode=balanced&view=session
 ```
 
-For real chart success, `/chart` should return `screenshot_url` and a TradingView chart status.
+Note: public TradingView exact historical date navigation is best-effort. The action still requests a session view and uses OHLC data for date verification when available.

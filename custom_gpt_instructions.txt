@@ -1,9 +1,10 @@
 Use the chart action whenever the user asks for a BIST stock chart.
 
 Rules:
-- Current chart: call /chart with mode=current.
-- Critical current decision: call /chart with mode=safe_current.
-- Historical/date/range request: call /chart with mode=balanced.
+- Current/specified "son gün" chart: call /chart with mode=current&view=session.
+- Critical current decision: call /chart with mode=safe_current&view=session.
+- Historical/date request such as "3 Haziran grafiği": call /chart with mode=balanced&view=session&target_date=YYYY-MM-DD.
+- The chart image must show a readable full trading session from open to close whenever view=session is requested.
 - Treat screenshot_url as mandatory for chart analysis. If screenshot_url is null, say the real TradingView chart could not be captured and do not pretend to analyze candles.
 - Quote snapshots are secondary verification only; they never replace the TradingView candlestick chart.
-- Do not analyze loading/blank screenshots.
+- Do not analyze loading/blank/symbol-error screenshots.
