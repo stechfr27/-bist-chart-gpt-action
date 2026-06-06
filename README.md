@@ -1,64 +1,45 @@
-# BIST Chart GPT Action API
+# BIST Chart GPT Action v1.3
 
-Bu paket, ChatGPT Custom GPT Actions ile çalışacak şekilde hazırlanmıştır.
+Bu servis, Custom GPT Action üzerinden BIST hisseleri için grafik ekran görüntüsü ve çok kaynaklı fiyat/veri teyidi döndürür.
 
-Amaç: Kullanıcı ChatGPT'ye “THYAO güncel 5dk grafiğini incele” veya “ASELS 2026-06-04 grafiğine bak” dediğinde API:
+## Kaynak mantığı
 
-1. TradingView üzerinde ilgili BIST grafiğini açar.
-2. Mum grafik ekran görüntüsü alır.
-3. Görseli `screenshot_url` olarak döndürür.
-4. Yahoo Finance üzerinden `.IS` formatıyla doğrulama/eksik veri tamamlama amaçlı OHLC ve hacim örneği ekler.
-5. ChatGPT'ye JSON olarak döndürür.
-
-## v1.1 güncellemesi
-
-- Yahoo Finance sembol formatı kesin olarak `THYAO.IS`, `ASELS.IS`, `TUPRS.IS` mantığına alındı.
-- Yahoo veri boş gelirse alternatif `download` ve `Ticker.history` fallback denemeleri eklendi.
-- 3m ve 10m gibi Yahoo tarafından desteklenmeyen aralıklar otomatik en yakın güvenli intervale çevrilir.
-- `screenshot_base64_png` varsayılan olarak kapatıldı; cevap şişmesin diye `screenshot_url` döner.
-- `include_base64=true` verilirse base64 görüntü yine alınabilir.
-- `data_status`, `ohlc_count`, `yahoo_symbol`, `yahoo_interval_used` alanları eklendi.
-
-## Dosyalar
-
-- `main.py`: FastAPI servis kodu
-- `Dockerfile`: Playwright/Chromium destekli deploy imajı
-- `requirements.txt`: Python paketleri
-- `render.yaml`: Render deploy ayarı
-- `openapi_schema_for_gpt_action.json`: Custom GPT Actions şeması
-- `custom_gpt_instructions.txt`: GPT'ye yapıştırılacak talimat
+- TradingView: ana mum grafik screenshot kaynağı.
+- Yahoo Finance: OHLC doğrulama / eksik veri tamamlama.
+- Stooq: Yahoo tıkanırsa günlük OHLC fallback.
+- Midas Canlı Borsa: ücretsiz web fiyat teyidi, sayfada 15 dakika gecikme notu bulunur.
+- BloombergHT Borsa: görünür borsa tablolarından özet fiyat/hacim teyidi.
+- Investing.com TR: görünür piyasa listelerinden özet fiyat teyidi.
+- Borsa İstanbul: resmi veri/duyuru/günlük bülten referansı; ücretsiz canlı intraday mum kaynağı gibi kullanılmaz.
 
 ## Deploy
 
-1. GitHub'daki eski dosyaların üstüne bu yeni dosyaları yükle.
-2. Render otomatik deploy açıksa kendisi yeniden deploy eder.
-3. Otomatik deploy kapalıysa Render panelinde `Manual Deploy > Deploy latest commit` yap.
-4. Deploy bitince health testini aç:
+1. Dosyaları GitHub reposuna yükle.
+2. Render'da Web Service oluştur.
+3. Runtime olarak Docker kullan.
+4. Deploy sonrası `/health` endpoint'ini test et.
 
-`https://SENIN-URL.onrender.com/health`
+Beklenen health cevabı:
 
-Beklenen:
+```json
+{"ok":true,"service":"bist-chart-gpt-action","version":"1.3.0-public-source-fallbacks"}
+```
 
-`{"ok": true, "service": "bist-chart-gpt-action", "version": "1.1.0-yahoo-fallback-fix"}`
+## Test
 
-## Test linkleri
+```text
+https://SENIN-URL.onrender.com/chart?symbol=THYAO&interval=5m&range_hint=5d
+```
 
-Güncel 5dk THYAO:
+Cevapta şunları görmelisin:
 
-`https://SENIN-URL.onrender.com/chart?symbol=THYAO&interval=5m&range_hint=5d`
+- `screenshot_url`
+- `ohlc_sample`
+- `quote_snapshots`
+- `official_reference`
+- `data_status`
+- `data_note`
 
-Base64 de istiyorsan:
+## Notlar
 
-`https://SENIN-URL.onrender.com/chart?symbol=THYAO&interval=5m&range_hint=5d&include_base64=true`
-
-Belirli tarih:
-
-`https://SENIN-URL.onrender.com/chart?symbol=THYAO&interval=5m&target_date=2026-06-04`
-
-3 aylık günlük:
-
-`https://SENIN-URL.onrender.com/chart?symbol=ASELS&interval=1d&range_hint=3mo`
-
-## Önemli not
-
-TradingView ekran görüntüsü görsel kaynak; Yahoo Finance verisi doğrulama ve eksik veri tamamlama amaçlıdır. BIST intraday verileri ücretsiz kaynaklarda gecikmeli veya kısıtlı olabilir. Kesin işlem öncesi aracı kurum ekranı ile teyit gerekir.
+Ücretsiz kaynaklar intraday mum verisini her zaman eksiksiz sağlamaz. Bu yüzden sistem görsel grafik + sayısal doğrulama + ek fiyat teyidi mantığıyla çalışır. Emir defteri, AKD/BOFA, karanlık oda ve derinlik verisi için aracı kurum ekranı gerekir.
