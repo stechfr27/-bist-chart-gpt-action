@@ -6,7 +6,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+import asyncio
 from typing import Optional
 
 import pandas as pd
@@ -14,10 +14,11 @@ import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
-from playwright.sync_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from starlette.concurrency import run_in_threadpool
+from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "1.6.0-source-url-encoding-fix"
+APP_VERSION = "1.7.0-async-playwright-source-fix"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -55,25 +56,30 @@ QUOTE_CACHE: dict[str, tuple[float, list[dict], dict]] = {}
 
 class BrowserManager:
     def __init__(self):
-        self._lock = Lock()
+        self._lock = asyncio.Lock()
         self._pw = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self.started_at = None
 
-    def get_context(self) -> BrowserContext:
-        with self._lock:
+    async def get_context(self) -> BrowserContext:
+        async with self._lock:
             if self._context:
                 return self._context
-            self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(
+            self._pw = await async_playwright().start()
+            self._browser = await self._pw.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-features=IsolateOrigins,site-per-process"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                ],
             )
             extra_headers = {}
             if TRADINGVIEW_COOKIE:
                 extra_headers["Cookie"] = TRADINGVIEW_COOKIE
-            self._context = self._browser.new_context(
+            self._context = await self._browser.new_context(
                 viewport={"width": 1440, "height": 950},
                 device_scale_factor=1,
                 locale="tr-TR",
@@ -84,21 +90,21 @@ class BrowserManager:
             self.started_at = datetime.now(timezone.utc).isoformat()
             return self._context
 
-    def reset(self):
-        with self._lock:
+    async def reset(self):
+        async with self._lock:
             try:
                 if self._context:
-                    self._context.close()
+                    await self._context.close()
             except Exception:
                 pass
             try:
                 if self._browser:
-                    self._browser.close()
+                    await self._browser.close()
             except Exception:
                 pass
             try:
                 if self._pw:
-                    self._pw.stop()
+                    await self._pw.stop()
             except Exception:
                 pass
             self._pw = None
@@ -137,8 +143,8 @@ app = FastAPI(
 app.mount("/screenshots", StaticFiles(directory=str(SCREENSHOT_DIR)), name="screenshots")
 
 @app.on_event("shutdown")
-def shutdown_event():
-    BROWSER.reset()
+async def shutdown_event():
+    await BROWSER.reset()
 
 @app.get("/")
 def root():
@@ -149,16 +155,16 @@ def health():
     return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at}
 
 @app.get("/warmup")
-def warmup():
+async def warmup():
     try:
-        ctx = BROWSER.get_context()
-        page = ctx.new_page()
-        page.goto("https://tr.tradingview.com/chart/", wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(5000)
-        page.close()
+        ctx = await BROWSER.get_context()
+        page = await ctx.new_page()
+        await page.goto("https://tr.tradingview.com/chart/", wait_until="domcontentloaded", timeout=90000)
+        await page.wait_for_timeout(5000)
+        await page.close()
         return {"ok": True, "version": APP_VERSION, "browser_started_at": BROWSER.started_at}
     except Exception as e:
-        BROWSER.reset()
+        await BROWSER.reset()
         raise HTTPException(status_code=503, detail=f"Warmup başarısız: {type(e).__name__}: {e}")
 
 def normalize_symbol(symbol: str) -> str:
@@ -179,7 +185,7 @@ def make_tv_url(symbol: str, interval: str) -> str:
 def absolute_url(request: Request, path: str) -> str:
     return f"{str(request.base_url).rstrip('/')}{path}"
 
-def click_soft_popups(page: Page):
+async def click_soft_popups(page: Page):
     selectors = [
         "button[aria-label='Close']", "button[aria-label='Kapat']", "button[data-name='close']",
         "button:has-text('Accept')", "button:has-text('Kabul')", "button:has-text('Tümünü kabul et')",
@@ -187,33 +193,33 @@ def click_soft_popups(page: Page):
     ]
     for selector in selectors:
         try:
-            page.locator(selector).first.click(timeout=600)
-            page.wait_for_timeout(250)
+            await page.locator(selector).first.click(timeout=600)
+            await page.wait_for_timeout(250)
         except Exception:
             pass
 
-def screenshot_tradingview(url: str, symbol: str, interval: str) -> tuple[Optional[Path], Optional[str], str, str]:
+async def screenshot_tradingview(url: str, symbol: str, interval: str) -> tuple[Optional[Path], Optional[str], str, str]:
     filename = f"{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}.png"
     out_path = SCREENSHOT_DIR / filename
     chart_status = "ok"
     chart_note = "TradingView grafiği yüklendi ve screenshot alındı."
-    ctx = BROWSER.get_context()
+    ctx = await BROWSER.get_context()
     page = None
     try:
-        page = ctx.new_page()
+        page = await ctx.new_page()
         page.set_default_timeout(18000)
         page.set_default_navigation_timeout(90000)
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=90000)
         except PlaywrightTimeoutError:
             chart_status = "partial_timeout"
             chart_note = "TradingView domcontentloaded timeout verdi; eldeki sayfa screenshotlandı."
-        page.wait_for_timeout(int(os.getenv("TV_INITIAL_WAIT_MS", "14000")))
-        click_soft_popups(page)
+        await page.wait_for_timeout(int(os.getenv("TV_INITIAL_WAIT_MS", "14000")))
+        await click_soft_popups(page)
         canvas_found = False
         for selector in ["canvas", "div.chart-container", "div[data-name='legend-source-item']"]:
             try:
-                page.locator(selector).first.wait_for(state="visible", timeout=10000)
+                await page.locator(selector).first.wait_for(state="visible", timeout=10000)
                 canvas_found = True
                 break
             except Exception:
@@ -221,23 +227,23 @@ def screenshot_tradingview(url: str, symbol: str, interval: str) -> tuple[Option
         if not canvas_found and chart_status == "ok":
             chart_status = "partial_no_canvas_detected"
             chart_note = "TradingView açıldı ama canvas/legend doğrulanamadı; viewport screenshot alındı."
-        page.screenshot(path=str(out_path), full_page=False, type="png")
+        await page.screenshot(path=str(out_path), full_page=False, type="png")
         return out_path, f"/screenshots/{filename}", chart_status, chart_note
     except Exception as e:
         chart_status = "chart_failed_data_only"
         chart_note = f"TradingView screenshot başarısız; veri katmanları yine döndürüldü. Hata: {type(e).__name__}: {e}"
         try:
             if page:
-                page.screenshot(path=str(out_path), full_page=False, type="png")
+                await page.screenshot(path=str(out_path), full_page=False, type="png")
                 return out_path, f"/screenshots/{filename}", "partial_screenshot_recovered", chart_note
         except Exception:
             pass
-        BROWSER.reset()
+        await BROWSER.reset()
         return None, None, chart_status, chart_note
     finally:
         try:
             if page:
-                page.close()
+                await page.close()
         except Exception:
             pass
 
@@ -398,7 +404,7 @@ def build_ohlc(symbol: str, yahoo_symbol: str, interval: str, range_hint: str, t
     return [], "no_ohlc_all_sources", combined_note
 
 @app.get("/chart", response_model=ChartResponse)
-def chart(
+async def chart(
     request: Request,
     symbol: str = Query(..., description="BIST sembolü. Örn: THYAO, ASELS, TUPRS"),
     interval: str = Query("5m", description="1m, 3m, 5m, 10m, 15m, 30m, 1h, 1d"),
@@ -414,9 +420,9 @@ def chart(
     yahoo_symbol = make_yahoo_symbol(clean_symbol)
     tv_url = make_tv_url(clean_symbol, interval)
 
-    out_path, shot_path, chart_status, chart_note = screenshot_tradingview(tv_url, clean_symbol, interval)
-    records, data_status, data_note = build_ohlc(clean_symbol, yahoo_symbol, interval, range_hint, target_date)
-    quote_snapshots, official_reference = fetch_public_quotes(clean_symbol)
+    out_path, shot_path, chart_status, chart_note = await screenshot_tradingview(tv_url, clean_symbol, interval)
+    records, data_status, data_note = await run_in_threadpool(build_ohlc, clean_symbol, yahoo_symbol, interval, range_hint, target_date)
+    quote_snapshots, official_reference = await run_in_threadpool(fetch_public_quotes, clean_symbol)
 
     screenshot_base64 = None
     screenshot_url = absolute_url(request, shot_path) if shot_path else None

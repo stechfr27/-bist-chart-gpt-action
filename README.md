@@ -1,4 +1,4 @@
-# BIST Chart GPT Action API v1.5 Final
+# BIST Chart GPT Action API v1.7 Final
 
 Bu proje ChatGPT Custom GPT Actions ile kullanılmak üzere hazırlanmış BIST grafik servisidir.
 
@@ -26,7 +26,7 @@ https://SENIN-URL.onrender.com/health
 Beklenen sürüm:
 
 ```json
-{"version":"1.6.0-source-url-encoding-fix"}
+{"version":"1.7.0-async-playwright-source-fix"}
 ```
 
 ## Warmup
