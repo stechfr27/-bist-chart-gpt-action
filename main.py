@@ -18,12 +18,18 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "1.7.0-async-playwright-source-fix"
+APP_VERSION = "1.9.0-current-speed-optimized"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
 QUOTE_CACHE_TTL_SECONDS = int(os.getenv("QUOTE_CACHE_TTL_SECONDS", "120"))
 TRADINGVIEW_COOKIE = os.getenv("TRADINGVIEW_COOKIE", "").strip()
+TV_WAIT_CURRENT_MS = int(os.getenv("TV_WAIT_CURRENT_MS", "6500"))
+TV_WAIT_BALANCED_MS = int(os.getenv("TV_WAIT_BALANCED_MS", "12000"))
+TV_CANVAS_WAIT_CURRENT_MS = int(os.getenv("TV_CANVAS_WAIT_CURRENT_MS", "3500"))
+TV_CANVAS_WAIT_BALANCED_MS = int(os.getenv("TV_CANVAS_WAIT_BALANCED_MS", "9000"))
+HTTP_TIMEOUT_CURRENT = int(os.getenv("HTTP_TIMEOUT_CURRENT", "5"))
+HTTP_TIMEOUT_BALANCED = int(os.getenv("HTTP_TIMEOUT_BALANCED", "10"))
 
 TV_INTERVALS = {"1m": "1", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "1h": "60", "1d": "D"}
 YF_INTERVALS = {"1m": "1m", "3m": "5m", "5m": "5m", "10m": "15m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d"}
@@ -159,7 +165,8 @@ async def warmup():
     try:
         ctx = await BROWSER.get_context()
         page = await ctx.new_page()
-        await page.goto("https://tr.tradingview.com/chart/", wait_until="domcontentloaded", timeout=90000)
+        await install_fast_routes(page)
+        await page.goto("https://tr.tradingview.com/chart/", wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(5000)
         await page.close()
         return {"ok": True, "version": APP_VERSION, "browser_started_at": BROWSER.started_at}
@@ -185,6 +192,30 @@ def make_tv_url(symbol: str, interval: str) -> str:
 def absolute_url(request: Request, path: str) -> str:
     return f"{str(request.base_url).rstrip('/')}{path}"
 
+async def install_fast_routes(page: Page):
+    """Block non-essential heavy resources while keeping TradingView JS/canvas intact."""
+    async def _route(route):
+        try:
+            req = route.request
+            rtype = req.resource_type
+            url = req.url.lower()
+            if rtype in {"font", "media"}:
+                await route.abort()
+                return
+            if any(x in url for x in ["doubleclick", "googlesyndication", "google-analytics", "analytics", "hotjar", "facebook", "adservice"]):
+                await route.abort()
+                return
+            await route.continue_()
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+    try:
+        await page.route("**/*", _route)
+    except Exception:
+        pass
+
 async def click_soft_popups(page: Page):
     selectors = [
         "button[aria-label='Close']", "button[aria-label='Kapat']", "button[data-name='close']",
@@ -198,7 +229,7 @@ async def click_soft_popups(page: Page):
         except Exception:
             pass
 
-async def screenshot_tradingview(url: str, symbol: str, interval: str) -> tuple[Optional[Path], Optional[str], str, str]:
+async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str = "current") -> tuple[Optional[Path], Optional[str], str, str]:
     filename = f"{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}.png"
     out_path = SCREENSHOT_DIR / filename
     chart_status = "ok"
@@ -207,26 +238,27 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str) -> tuple[
     page = None
     try:
         page = await ctx.new_page()
-        page.set_default_timeout(18000)
-        page.set_default_navigation_timeout(90000)
+        await install_fast_routes(page)
+        page.set_default_timeout(12000 if mode in {"current", "fast"} else 18000)
+        page.set_default_navigation_timeout(60000 if mode in {"current", "fast"} else 90000)
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000 if mode in {"current", "fast"} else 90000)
         except PlaywrightTimeoutError:
             chart_status = "partial_timeout"
             chart_note = "TradingView domcontentloaded timeout verdi; eldeki sayfa screenshotlandı."
-        await page.wait_for_timeout(int(os.getenv("TV_INITIAL_WAIT_MS", "14000")))
+        await page.wait_for_timeout(TV_WAIT_CURRENT_MS if mode in {"current", "fast"} else TV_WAIT_BALANCED_MS)
         await click_soft_popups(page)
         canvas_found = False
         for selector in ["canvas", "div.chart-container", "div[data-name='legend-source-item']"]:
             try:
-                await page.locator(selector).first.wait_for(state="visible", timeout=10000)
+                await page.locator(selector).first.wait_for(state="visible", timeout=TV_CANVAS_WAIT_CURRENT_MS if mode in {"current", "fast"} else TV_CANVAS_WAIT_BALANCED_MS)
                 canvas_found = True
                 break
             except Exception:
                 pass
         if not canvas_found and chart_status == "ok":
             chart_status = "partial_no_canvas_detected"
-            chart_note = "TradingView açıldı ama canvas/legend doğrulanamadı; viewport screenshot alındı."
+            chart_note = "TradingView sayfası açıldı ve viewport screenshot alındı; canvas/legend otomatik doğrulaması kesinleşmedi. Görsel yine analiz için kullanılabilir."
         await page.screenshot(path=str(out_path), full_page=False, type="png")
         return out_path, f"/screenshots/{filename}", chart_status, chart_note
     except Exception as e:
@@ -318,7 +350,7 @@ def fetch_stooq_daily(symbol: str) -> tuple[list[dict], str, str]:
     OHLC_CACHE[cache_key] = (time.time(), [], "no_stooq_data", "Stooq", note)
     return [], "no_stooq_data", note
 
-def http_get_text(url: str, timeout: int = 12) -> tuple[str, Optional[str]]:
+def http_get_text(url: str, timeout: int = 10) -> tuple[str, Optional[str]]:
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
         "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -327,14 +359,47 @@ def http_get_text(url: str, timeout: int = 12) -> tuple[str, Optional[str]]:
     try:
         r = requests.get(url, headers=headers, timeout=timeout)
         r.raise_for_status()
-        # Some Turkish pages omit/lie about encoding; apparent_encoding prevents mojibake like ÄŸ/ÅŸ.
-        if r.encoding is None or r.encoding.lower() in {"iso-8859-1", "latin-1"}:
-            r.encoding = r.apparent_encoding or "utf-8"
-        return r.text, None
+        content_type = r.headers.get("content-type", "").lower()
+        # Turkish finance pages are usually UTF-8; requests may guess latin encodings and produce mojibake.
+        if "charset=" in content_type:
+            text = r.text
+        else:
+            try:
+                text = r.content.decode("utf-8")
+            except Exception:
+                r.encoding = r.apparent_encoding or "utf-8"
+                text = r.text
+        return repair_mojibake(text), None
     except Exception as e:
         return "", f"{type(e).__name__}: {e}"
 
+def repair_mojibake(text: str) -> str:
+    # Fix common UTF-8 decoded as latin-1/cp1252 artifacts seen as TÃ¼rk / Ä° / ÅŸ.
+    if not text:
+        return text
+    suspicious = ("Ã", "Ä", "Å", "â€", "â€™", "&uuml;", "&ouml;", "&ccedil;")
+    text = html_lib.unescape(text)
+    if any(x in text for x in suspicious):
+        for enc in ("latin1", "cp1252"):
+            try:
+                fixed = text.encode(enc, errors="ignore").decode("utf-8", errors="ignore")
+                # Prefer the version with fewer mojibake markers, but avoid empty/over-short results.
+                if len(fixed) > len(text) * 0.65 and sum(fixed.count(x) for x in ("Ã", "Ä", "Å", "â€")) < sum(text.count(x) for x in ("Ã", "Ä", "Å", "â€")):
+                    text = fixed
+                    break
+            except Exception:
+                pass
+    replacements = {
+        "Ä°": "İ", "Ä±": "ı", "ÅŸ": "ş", "Å": "Ş", "ÄŸ": "ğ", "Äž": "Ğ",
+        "Ã¼": "ü", "Ãœ": "Ü", "Ã¶": "ö", "Ã–": "Ö", "Ã§": "ç", "Ã‡": "Ç",
+        "â€™": "’", "â€˜": "‘", "â€œ": "“", "â€": "”", "â€“": "–", "â€”": "—",
+    }
+    for a, b in replacements.items():
+        text = text.replace(a, b)
+    return text
+
 def clean_html_text(html: str) -> list[str]:
+    html = repair_mojibake(html)
     text = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
     text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
     text = re.sub(r"<[^>]+>", "\n", text)
@@ -348,35 +413,39 @@ def extract_context_text(html: str, symbol: str) -> str:
     joined = " | ".join(hits[:28])
     return joined[:1600]
 
-def make_quote_sources(symbol: str) -> list[tuple[str, str]]:
+def make_quote_sources(symbol: str, mode: str = "balanced") -> list[tuple[str, str]]:
     midas_symbol = symbol.lower()
     sources = [
         ("Midas direct", f"https://www.getmidas.com/canli-borsa/{midas_symbol}-hisse/"),
-        ("Midas live table", "https://www.getmidas.com/canli-borsa/"),
     ]
+    if mode not in {"current", "fast"}:
+        sources.append(("Midas live table", "https://www.getmidas.com/canli-borsa/"))
     bloom_slug = BLOOMBERGHT_SLUGS.get(symbol.upper())
     if bloom_slug:
         sources.append(("BloombergHT direct", f"https://www.bloomberght.com/borsa/hisse/{bloom_slug}"))
-    sources.append(("BloombergHT borsa", "https://www.bloomberght.com/borsa"))
+    if mode not in {"current", "fast"}:
+        sources.append(("BloombergHT borsa", "https://www.bloomberght.com/borsa"))
     inv_slug = INVESTING_SLUGS.get(symbol.upper())
-    if inv_slug:
-        sources.append(("Investing direct", f"https://tr.investing.com/equities/{inv_slug}"))
-    sources.append(("Investing search", f"https://tr.investing.com/search/?q={symbol}"))
+    if mode not in {"current", "fast"}:
+        if inv_slug:
+            sources.append(("Investing direct", f"https://tr.investing.com/equities/{inv_slug}"))
+        sources.append(("Investing search", f"https://tr.investing.com/search/?q={symbol}"))
     return sources
 
-def fetch_public_quotes(symbol: str) -> tuple[list[dict], dict]:
-    cache_key = f"quotes:{symbol}"
+def fetch_public_quotes(symbol: str, mode: str = "balanced") -> tuple[list[dict], dict]:
+    cache_key = f"quotes:{symbol}:{mode}"
     cached = QUOTE_CACHE.get(cache_key)
     if cached and time.time() - cached[0] < QUOTE_CACHE_TTL_SECONDS:
         return cached[1], cached[2]
     snapshots = []
-    for name, url in make_quote_sources(symbol):
-        html, err = http_get_text(url)
+    timeout = HTTP_TIMEOUT_CURRENT if mode in {"current", "fast"} else HTTP_TIMEOUT_BALANCED
+    for name, url in make_quote_sources(symbol, mode):
+        html, err = http_get_text(url, timeout=timeout)
         entry = {"source": name, "url": url, "status": "ok" if html else "error", "note": None, "context": None}
         if err:
-            entry["note"] = err
+            entry["note"] = repair_mojibake(err)
         else:
-            entry["context"] = extract_context_text(html, symbol)
+            entry["context"] = repair_mojibake(extract_context_text(html, symbol))
             if name.startswith("Midas"):
                 entry["note"] = "Midas canlı borsa sayfası BIST kaynaklı en az 15 dakika gecikmeli olabilir; ek fiyat teyidi olarak kullanılır."
             if name.startswith("BloombergHT"):
@@ -393,10 +462,14 @@ def fetch_public_quotes(symbol: str) -> tuple[list[dict], dict]:
     QUOTE_CACHE[cache_key] = (time.time(), snapshots, official)
     return snapshots, official
 
-def build_ohlc(symbol: str, yahoo_symbol: str, interval: str, range_hint: str, target_date: Optional[str]):
+def build_ohlc(symbol: str, yahoo_symbol: str, interval: str, range_hint: str, target_date: Optional[str], mode: str = "balanced") :
+    if mode == "current" and not target_date:
+        return [], "current_quote_only", "Current mode: güncel grafik hız öncelikli; yavaş Yahoo/Stooq OHLC çağrıları atlandı. Fiyat teyidi public quote katmanlarından yapılır."
     records, status, note = fetch_yahoo_ohlc(yahoo_symbol, interval, range_hint, target_date)
     if records:
         return records, status, note
+    if mode == "fast":
+        return [], "fast_no_ohlc", f"{note} | Fast mode: Stooq günlük fallback atlandı."
     stooq_records, stooq_status, stooq_note = fetch_stooq_daily(symbol)
     combined_note = f"{note} | {stooq_note}"
     if stooq_records:
@@ -411,18 +484,24 @@ async def chart(
     range_hint: str = Query("5d", description="Yahoo period ipucu: 1d, 5d, 1mo, 3mo, 6mo, 1y..."),
     target_date: Optional[str] = Query(None, description="YYYY-MM-DD; tarihli analiz için doğrulama notu/veri aralığı."),
     include_base64: bool = Query(False, description="true ise screenshot base64 döner; genelde false kalsın."),
+    mode: str = Query("current", description="current, fast veya balanced. current güncel grafik için en hızlı güvenli moddur; balanced tarihsel/OHLC için daha detaylıdır."),
 ):
     clean_symbol = normalize_symbol(symbol)
     if interval not in TV_INTERVALS:
         raise HTTPException(status_code=400, detail=f"Geçersiz interval: {interval}. Destek: {', '.join(TV_INTERVALS.keys())}")
+    if mode not in {"current", "balanced", "fast"}:
+        raise HTTPException(status_code=400, detail="mode current, balanced veya fast olmalı.")
     if target_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", target_date):
         raise HTTPException(status_code=400, detail="target_date YYYY-MM-DD formatında olmalı.")
     yahoo_symbol = make_yahoo_symbol(clean_symbol)
     tv_url = make_tv_url(clean_symbol, interval)
 
-    out_path, shot_path, chart_status, chart_note = await screenshot_tradingview(tv_url, clean_symbol, interval)
-    records, data_status, data_note = await run_in_threadpool(build_ohlc, clean_symbol, yahoo_symbol, interval, range_hint, target_date)
-    quote_snapshots, official_reference = await run_in_threadpool(fetch_public_quotes, clean_symbol)
+    screenshot_task = screenshot_tradingview(tv_url, clean_symbol, interval, mode)
+    ohlc_task = run_in_threadpool(build_ohlc, clean_symbol, yahoo_symbol, interval, range_hint, target_date, mode)
+    quotes_task = run_in_threadpool(fetch_public_quotes, clean_symbol, mode)
+    (out_path, shot_path, chart_status, chart_note), (records, data_status, data_note), (quote_snapshots, official_reference) = await asyncio.gather(
+        screenshot_task, ohlc_task, quotes_task
+    )
 
     screenshot_base64 = None
     screenshot_url = absolute_url(request, shot_path) if shot_path else None
@@ -443,7 +522,7 @@ async def chart(
         range_hint=range_hint,
         target_date=target_date,
         source_chart="TradingView visual chart screenshot via persistent Playwright browser",
-        source_data="Yahoo Finance OHLC + Stooq daily fallback + Midas/BloombergHT/Investing public quote checks + Borsa İstanbul official reference",
+        source_data="TradingView screenshot + fast public quote checks; Yahoo/Stooq OHLC only in balanced/dated modes + Borsa İstanbul official reference",
         tradingview_url=tv_url,
         screenshot_url=screenshot_url,
         screenshot_base64_png=screenshot_base64,

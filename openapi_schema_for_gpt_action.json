@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BIST Chart GPT Action API",
-    "description": "BIST hisseleri için TradingView screenshot, Yahoo/Stooq OHLC ve public quote doğrulama verisi sağlar.",
-    "version": "1.5.0"
+    "description": "BIST hisseleri için hızlı güncel TradingView screenshot, public quote doğrulama ve gerektiğinde Yahoo/Stooq OHLC sağlar.",
+    "version": "1.9.0"
   },
   "servers": [
     {
@@ -53,7 +53,16 @@
             "required": false,
             "schema": {
               "type": "string",
-              "enum": ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d"],
+              "enum": [
+                "1m",
+                "3m",
+                "5m",
+                "10m",
+                "15m",
+                "30m",
+                "1h",
+                "1d"
+              ],
               "default": "5m"
             }
           },
@@ -63,9 +72,9 @@
             "required": false,
             "schema": {
               "type": "string",
-              "default": "5d"
+              "default": "1d"
             },
-            "description": "Yahoo period ipucu: 1d, 5d, 1mo, 3mo, 6mo, 1y gibi."
+            "description": "Yahoo period ipucu. Güncel analizde önemli değildir; balanced/tarihli analizde kullanılır."
           },
           {
             "name": "target_date",
@@ -75,6 +84,21 @@
               "type": "string"
             },
             "description": "YYYY-MM-DD formatında tarihli analiz isteği."
+          },
+          {
+            "name": "mode",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "current",
+                "fast",
+                "balanced"
+              ],
+              "default": "current"
+            },
+            "description": "current: güncel grafik için en hızlı güvenli mod; TradingView screenshot + Midas/Bloomberg hızlı teyit. balanced: OHLC/Yahoo/Stooq daha detaylı."
           },
           {
             "name": "include_base64",
