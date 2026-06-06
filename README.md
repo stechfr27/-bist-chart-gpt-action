@@ -1,18 +1,27 @@
-# BIST Chart GPT Action v2.5
+# BIST Chart GPT Action API v3.0
 
-Fast and safe current-chart mode for BIST symbols.
+Strict graph-first version.
+
+## Core rule
+The `/chart` endpoint returns only a verified TradingView chart screenshot as `screenshot_url`.
+It does not return Midas/Bloomberg/other public pages as a chart image.
+It also rejects blank/loading TradingView screenshots.
+
+## Capture order
+1. Local minimal TradingView Advanced Chart Widget HTML
+2. Official TradingView widgetembed
+3. Full TradingView chart page
 
 ## Modes
+- `mode=current`: fastest current-chart mode.
+- `mode=safe_current`: longer strict TradingView capture for important checks.
+- `mode=balanced`: slower historical/OHLC helper mode.
 
-- `mode=current`: default. 45-second visual-safe hard timeout. Uses TradingView screenshot + Midas/BloombergHT quote checks. Skips Yahoo/Stooq for speed.
-- `mode=safe_current`: 60-second visual-safe hard timeout for important current checks.
-- `mode=balanced`: slower historical/OHLC mode, up to about 115 seconds.
+If all strict TradingView capture paths fail on Render, `screenshot_url` remains null and `chart_status` explains why. This is deliberate: the service will not fake a chart with a non-chart fallback.
 
-The API rejects loading/blank TradingView screenshots. If a verified chart cannot be captured in time, `screenshot_url` is `null`; quote layers still return.
-
-## Test
-
-`/health`
-`/warmup`
-`/chart?symbol=THYAO&interval=5m&mode=current`
-`/chart?symbol=THYAO&interval=5m&mode=safe_current`
+## Useful endpoints
+- `/health`
+- `/warmup`
+- `/chart?symbol=THYAO&interval=5m&mode=current`
+- `/screenshots-list`
+- `/screenshots-clear`

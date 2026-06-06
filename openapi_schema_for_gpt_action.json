@@ -2,41 +2,37 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BIST Chart GPT Action API",
-    "version": "2.5.0",
-    "description": "BIST chart screenshot API. current=45s safe-fast; safe_current=60s; balanced=historical/OHLC."
+    "version": "3.0.0"
   },
   "servers": [
     {
-      "url": "https://YOUR-RENDER-URL.onrender.com"
+      "url": "https://bist-chart-gpt-action.onrender.com"
     }
   ],
   "paths": {
     "/health": {
       "get": {
-        "operationId": "healthCheck",
-        "summary": "Check service health",
+        "operationId": "health",
         "responses": {
           "200": {
-            "description": "Service health"
+            "description": "OK"
           }
         }
       }
     },
     "/warmup": {
       "get": {
-        "operationId": "warmupBrowser",
-        "summary": "Warm up browser for faster chart screenshots",
+        "operationId": "warmup",
         "responses": {
           "200": {
-            "description": "Warmup result"
+            "description": "Browser warmup"
           }
         }
       }
     },
     "/chart": {
       "get": {
-        "operationId": "getBistChartSnapshot",
-        "summary": "Get BIST chart screenshot and verification data",
+        "operationId": "getBistChart",
         "parameters": [
           {
             "name": "symbol",
@@ -45,7 +41,7 @@
             "schema": {
               "type": "string"
             },
-            "description": "BIST symbol, e.g. THYAO, ASELS, TUPRS"
+            "description": "BIST symbol, e.g. THYAO, ASELS"
           },
           {
             "name": "interval",
@@ -64,37 +60,7 @@
                 "1h",
                 "1d"
               ]
-            },
-            "description": "Chart interval"
-          },
-          {
-            "name": "range_hint",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "5d"
-            },
-            "description": "Yahoo period hint for balanced mode"
-          },
-          {
-            "name": "target_date",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            },
-            "description": "YYYY-MM-DD for dated analysis"
-          },
-          {
-            "name": "include_base64",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false
-            },
-            "description": "Return screenshot base64. Usually false."
+            }
           },
           {
             "name": "mode",
@@ -109,13 +75,47 @@
                 "balanced",
                 "fast"
               ]
-            },
-            "description": "current (default, 45s safe-fast), safe_current (60s safer), balanced (historical/OHLC), fast (legacy)"
+            }
+          },
+          {
+            "name": "range_hint",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "5d"
+            }
+          },
+          {
+            "name": "target_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_base64",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "auto_clear",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Chart screenshot and verification data"
+            "description": "Strict TradingView chart response"
           }
         }
       }

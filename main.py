@@ -19,7 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "2.6.0-graph-first-current"
+APP_VERSION = "3.0.0-strict-tradingview-image"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -33,12 +33,12 @@ HTTP_TIMEOUT_CURRENT = int(os.getenv("HTTP_TIMEOUT_CURRENT", "2"))
 HTTP_TIMEOUT_BALANCED = int(os.getenv("HTTP_TIMEOUT_BALANCED", "7"))
 AUTO_CLEAR_SCREENSHOTS = os.getenv("AUTO_CLEAR_SCREENSHOTS", "true").lower() in {"1", "true", "yes", "on"}
 SCREENSHOT_KEEP_LAST = int(os.getenv("SCREENSHOT_KEEP_LAST", "0"))
-TV_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_CURRENT_HARD_TIMEOUT_SECONDS", "55"))
+TV_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_CURRENT_HARD_TIMEOUT_SECONDS", "65"))
 TV_BALANCED_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_BALANCED_HARD_TIMEOUT_SECONDS", "115"))
 QUOTE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("QUOTE_CURRENT_HARD_TIMEOUT_SECONDS", "2"))
-TOTAL_CHART_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_CHART_HARD_TIMEOUT_SECONDS", "60"))
-TV_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_SAFE_CURRENT_HARD_TIMEOUT_SECONDS", "75"))
-TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS", "85"))
+TOTAL_CHART_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_CHART_HARD_TIMEOUT_SECONDS", "70"))
+TV_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_SAFE_CURRENT_HARD_TIMEOUT_SECONDS", "90"))
+TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS", "95"))
 TOTAL_BALANCED_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_BALANCED_HARD_TIMEOUT_SECONDS", "115"))
 USE_WIDGET_FOR_CURRENT = os.getenv("USE_WIDGET_FOR_CURRENT", "true").lower() in {"1", "true", "yes", "on"}
 
@@ -155,7 +155,7 @@ class ChartResponse(BaseModel):
 
 app = FastAPI(
     title="BIST Chart GPT Action API",
-    description="ChatGPT Actions compatible BIST chart service: TradingView screenshot + Yahoo/Stooq/Midas/BloombergHT/Investing/Borsa Istanbul verification layers.",
+    description="ChatGPT Actions compatible BIST chart service: strict TradingView screenshot first; no loading screen or non-chart fallback is returned as chart.",
     version=APP_VERSION,
 )
 app.mount("/screenshots", StaticFiles(directory=str(SCREENSHOT_DIR)), name="screenshots")
@@ -211,6 +211,61 @@ def make_tv_widget_url(symbol: str, interval: str) -> str:
         "&withdateranges=1&hideideas=1&studies_overrides={}&overrides={}&enabled_features=[]&disabled_features=[]"
         "&locale=tr"
     )
+
+
+def make_tv_local_html(symbol: str, interval: str) -> str:
+    tv_interval = TV_INTERVALS.get(interval, "5")
+    # Local minimal TradingView Advanced Chart Widget page.
+    # This is usually faster and cleaner than opening the full TradingView site on Render.
+    html = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset='utf-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <title>BIST:{symbol} {tv_interval}</title>
+  <style>
+    html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#ffffff; }}
+    #tv_chart_container {{ width:100vw; height:100vh; }}
+    .fallback-note {{ position:absolute; top:8px; left:8px; z-index:1; font:12px Arial; color:#777; }}
+  </style>
+</head>
+<body>
+  <div id='tv_chart_container'></div>
+  <script src='https://s3.tradingview.com/tv.js'></script>
+  <script>
+    function boot() {{
+      if (!window.TradingView) {{ setTimeout(boot, 300); return; }}
+      new TradingView.widget({{
+        autosize: true,
+        symbol: 'BIST:{symbol}',
+        interval: '{tv_interval}',
+        timezone: 'Europe/Istanbul',
+        theme: 'light',
+        style: '1',
+        locale: 'tr',
+        toolbar_bg: '#f1f3f6',
+        enable_publishing: false,
+        hide_side_toolbar: false,
+        hide_top_toolbar: false,
+        allow_symbol_change: false,
+        save_image: false,
+        container_id: 'tv_chart_container'
+      }});
+    }}
+    boot();
+  </script>
+</body>
+</html>
+""".strip()
+    return "data:text/html;charset=utf-8," + requests.utils.quote(html)
+
+def make_midas_url(symbol: str) -> str:
+    return f"https://www.getmidas.com/canli-borsa/{symbol.lower()}-hisse/"
+
+def make_bloomberg_url(symbol: str) -> str:
+    slug = BLOOMBERGHT_SLUGS.get(symbol, f"{symbol.lower()}-detay")
+    return f"https://www.bloomberght.com/borsa/hisse/{slug}"
 
 def absolute_url(request: Request, path: str) -> str:
     return f"{str(request.base_url).rstrip('/')}{path}"
@@ -352,45 +407,125 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
         except Exception:
             pass
 
+async def _screenshot_public_visual_fallback(symbol: str, interval: str, mode: str) -> tuple[Optional[Path], Optional[str], str, str]:
+    """Last-resort visual fallback when TradingView cannot render in headless Render.
+    It is not a candle-chart guarantee; it gives GPT a visual market page only when it passes a non-loading check.
+    """
+    img_type = "jpeg"
+    ext = "jpg"
+    ctx = await BROWSER.get_context()
+    candidates = [
+        ("midas_page", make_midas_url(symbol)),
+        ("bloomberg_page", make_bloomberg_url(symbol)),
+    ]
+    notes = []
+    for source_kind, page_url in candidates:
+        filename = f"{symbol}_{interval}_{source_kind}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}.{ext}"
+        out_path = SCREENSHOT_DIR / filename
+        page = None
+        try:
+            page = await ctx.new_page()
+            await install_fast_routes(page)
+            page.set_default_timeout(4000)
+            page.set_default_navigation_timeout(12000)
+            await page.goto(page_url, wait_until="domcontentloaded", timeout=12000)
+            await click_soft_popups(page)
+            await page.wait_for_timeout(2200)
+            await page.screenshot(path=str(out_path), full_page=False, type="jpeg", quality=76, timeout=5000)
+            # Use a lighter check: public pages are not pure chart canvases, but reject blank/loading white pages.
+            if screenshot_has_chart_content(out_path):
+                return out_path, f"/screenshots/{filename}", "ok_public_visual_fallback", f"TradingView did not render in time; public visual fallback captured from {source_kind}. Use this only as fallback visual context, not as a guaranteed TradingView candle chart."
+            notes.append(f"{source_kind}: visual validation failed")
+            try:
+                if out_path.exists():
+                    out_path.unlink()
+            except Exception:
+                pass
+        except Exception as e:
+            notes.append(f"{source_kind}: {type(e).__name__}: {e}")
+            try:
+                if out_path.exists():
+                    out_path.unlink()
+            except Exception:
+                pass
+        finally:
+            try:
+                if page:
+                    await page.close()
+            except Exception:
+                pass
+    return None, None, "chart_timeboxed_no_image", "TradingView failed and public visual fallback also failed/rejected. " + " | ".join(notes)
+
 async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str = "current") -> tuple[Optional[Path], Optional[str], str, str]:
-    """Graph-first, timeboxed TradingView capture.
-    For current/safe_current the priority is NOT quote data; it is getting a real, visually verified candle chart fast.
-    It never returns a screenshot that fails the visual content check, so GPT won't analyze loading screens.
+    """Strict TradingView-only capture.
+    Goal: return the exact requested TradingView chart image, not a public quote page.
+    Order:
+      1) Local minimal TradingView Advanced Chart Widget HTML
+      2) Official TradingView widgetembed URL
+      3) Full TradingView /chart URL
+    It never returns loading/blank images and never returns Midas/Bloomberg as chart.
     """
     hard_timeout = TV_SAFE_CURRENT_HARD_TIMEOUT_SECONDS if mode == "safe_current" else (TV_CURRENT_HARD_TIMEOUT_SECONDS if mode in {"current", "fast"} else TV_BALANCED_HARD_TIMEOUT_SECONDS)
 
+    async def _try_with_budget(coro, seconds: int, timeout_status: str, timeout_note: str):
+        try:
+            return await asyncio.wait_for(coro, timeout=seconds)
+        except asyncio.TimeoutError:
+            return None, None, timeout_status, timeout_note
+        except Exception as e:
+            return None, None, "chart_failed_data_only", f"{type(e).__name__}: {e}"
+
     async def _run():
         notes = []
-        # Graph-first current mode: give the lightweight widget a short first chance, then spend the rest on full TradingView.
-        # This avoids wasting the whole request on a stuck widget while still allowing the fastest path when it works.
-        if mode in {"current", "fast", "safe_current"} and USE_WIDGET_FOR_CURRENT:
-            widget_url = make_tv_widget_url(symbol, interval)
-            widget_budget = 16 if mode in {"current", "fast"} else 22
-            try:
-                out_path, shot_path, status, note = await asyncio.wait_for(
-                    _screenshot_single_url(widget_url, symbol, interval, mode, "widget"),
-                    timeout=widget_budget,
-                )
-            except asyncio.TimeoutError:
-                out_path, shot_path, status, note = None, None, "widget_timeboxed", f"TradingView widget timeboxed at {widget_budget}s; full chart fallback started."
+        # 1) Local minimal TV widget HTML: fastest exact TradingView chart path.
+        if mode in {"current", "fast", "safe_current"}:
+            local_budget = 24 if mode in {"current", "fast"} else 34
+            local_url = make_tv_local_html(symbol, interval)
+            out_path, shot_path, status, note = await _try_with_budget(
+                _screenshot_single_url(local_url, symbol, interval, mode, "tvlocal"),
+                local_budget,
+                "tvlocal_timeboxed",
+                f"Local TradingView widget timeboxed at {local_budget}s."
+            )
             notes.append(note)
             if out_path and shot_path:
-                return out_path, shot_path, status, note + " | Fast path: lightweight TradingView widget used."
+                return out_path, shot_path, "ok_tradingview_local_widget", note + " | Exact TradingView chart path: local widget."
 
-        # Full chart gets the remaining budget. This is the most important layer because the user needs the visual graph.
-        remaining_note = "Full TradingView chart fallback used; graph image is the priority layer."
-        out_path, shot_path, status, note = await _screenshot_single_url(url, symbol, interval, mode, "full")
-        if notes:
-            note = " | ".join(notes + [remaining_note, note])
-        return out_path, shot_path, status, note
+        # 2) Official lightweight widgetembed.
+        if mode in {"current", "fast", "safe_current"} and USE_WIDGET_FOR_CURRENT:
+            widget_budget = 22 if mode in {"current", "fast"} else 30
+            widget_url = make_tv_widget_url(symbol, interval)
+            out_path, shot_path, status, note = await _try_with_budget(
+                _screenshot_single_url(widget_url, symbol, interval, mode, "widget"),
+                widget_budget,
+                "widget_timeboxed",
+                f"TradingView widgetembed timeboxed at {widget_budget}s."
+            )
+            notes.append(note)
+            if out_path and shot_path:
+                return out_path, shot_path, "ok_tradingview_widgetembed", note + " | Exact TradingView chart path: official widgetembed."
+
+        # 3) Full TradingView chart, most complete but heaviest.
+        full_budget = 38 if mode in {"current", "fast"} else (56 if mode == "safe_current" else hard_timeout)
+        out_path, shot_path, status, note = await _try_with_budget(
+            _screenshot_single_url(url, symbol, interval, mode, "full"),
+            full_budget,
+            "full_chart_timeboxed",
+            f"Full TradingView chart timeboxed at {full_budget}s."
+        )
+        notes.append(note)
+        if out_path and shot_path:
+            return out_path, shot_path, "ok_tradingview_full_chart", " | ".join(notes + ["Exact TradingView chart path: full chart."])
+
+        return None, None, "strict_tradingview_image_failed", " | ".join(notes + ["No verified TradingView chart image returned. No public quote-page fallback was used, because user requested the actual chart screenshot only."])
 
     try:
         return await asyncio.wait_for(_run(), timeout=hard_timeout)
     except asyncio.TimeoutError:
-        return None, None, "chart_timeboxed_no_image", f"TradingView graph capture timeboxed at {hard_timeout}s; no loading/blank screenshot was returned. Quote layers may still return."
+        return None, None, "strict_tradingview_timeboxed_no_image", f"Strict TradingView chart capture hard-timeboxed at {hard_timeout}s; no loading/blank screenshot was returned."
     except Exception as e:
         await BROWSER.reset()
-        return None, None, "chart_failed_data_only", f"TradingView graph capture failed; quote layers may still return. Error: {type(e).__name__}: {e}"
+        return None, None, "strict_tradingview_failed", f"Strict TradingView chart capture failed. Error: {type(e).__name__}: {e}"
 
 def df_to_records(df: pd.DataFrame, limit: int = 80) -> list[dict]:
     if df is None or df.empty:
@@ -650,7 +785,7 @@ async def chart(
     range_hint: str = Query("5d", description="Yahoo period ipucu: 1d, 5d, 1mo, 3mo, 6mo, 1y..."),
     target_date: Optional[str] = Query(None, description="YYYY-MM-DD; tarihli analiz için doğrulama notu/veri aralığı."),
     include_base64: bool = Query(False, description="true ise screenshot base64 döner; genelde false kalsın."),
-    mode: str = Query("current", description="current, safe_current, fast veya balanced. current guncel grafik icin graph-first 55sn moddur; safe_current 75sn daha guvenlidir; balanced tarihsel/OHLC icin detaylidir."),
+    mode: str = Query("current", description="current, safe_current, fast veya balanced. current guncel grafik icin budgeted graph-first 65sn moddur; safe_current 90sn daha guvenlidir; balanced tarihsel/OHLC icin detaylidir."),
     auto_clear: bool = Query(True, description="true ise yeni grafik isteginden once eski screenshot dosyalarini siler."),
 ):
     clean_symbol = normalize_symbol(symbol)
@@ -668,17 +803,25 @@ async def chart(
         clear_result = clear_screenshot_files(keep_last=SCREENSHOT_KEEP_LAST)
 
     request_timeout = TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS if mode == "safe_current" else (TOTAL_BALANCED_HARD_TIMEOUT_SECONDS if mode == "balanced" else TOTAL_CHART_HARD_TIMEOUT_SECONDS)
-    screenshot_task = screenshot_tradingview(tv_url, clean_symbol, interval, mode)
-    ohlc_task = run_in_threadpool(build_ohlc, clean_symbol, yahoo_symbol, interval, range_hint, target_date, mode)
-    quotes_task = run_in_threadpool(fetch_public_quotes, clean_symbol, mode)
+    screenshot_task = asyncio.create_task(screenshot_tradingview(tv_url, clean_symbol, interval, mode))
+    ohlc_task = asyncio.create_task(run_in_threadpool(build_ohlc, clean_symbol, yahoo_symbol, interval, range_hint, target_date, mode))
+    quotes_task = asyncio.create_task(run_in_threadpool(fetch_public_quotes, clean_symbol, mode))
+
     try:
-        (out_path, shot_path, chart_status, chart_note), (records, data_status, data_note), (quote_snapshots, official_reference) = await asyncio.wait_for(
-            asyncio.gather(screenshot_task, ohlc_task, quotes_task),
-            timeout=request_timeout,
-        )
+        # Graph-first: give the TradingView image the budget. Verification data must not block the chart.
+        out_path, shot_path, chart_status, chart_note = await asyncio.wait_for(screenshot_task, timeout=request_timeout)
     except asyncio.TimeoutError:
         out_path, shot_path, chart_status, chart_note = None, None, "request_timeboxed_no_image", f"Request timeboxed at {request_timeout}s; no unverified image returned."
-        records, data_status, data_note = [], "timeboxed_no_ohlc", "Slow OHLC layer was skipped by hard timeout."
+
+    try:
+        # In current modes build_ohlc returns immediately; if a thread stalls, skip it without touching chart speed.
+        records, data_status, data_note = await asyncio.wait_for(ohlc_task, timeout=1 if mode in {"current", "fast", "safe_current"} else 20)
+    except Exception:
+        records, data_status, data_note = [], "ohlc_nonblocking_skipped", "OHLC layer was skipped/non-blocking so graph capture stays fast."
+
+    try:
+        quote_snapshots, official_reference = await asyncio.wait_for(quotes_task, timeout=QUOTE_CURRENT_HARD_TIMEOUT_SECONDS if mode in {"current", "fast", "safe_current"} else 12)
+    except Exception:
         quote_snapshots, official_reference = [], {"source": "Borsa Istanbul", "status": "reference_only", "url": "https://www.borsaistanbul.com/", "note": "Official reference/news/daily bulletin source."}
 
     screenshot_base64 = None
@@ -700,7 +843,7 @@ async def chart(
         range_hint=range_hint,
         target_date=target_date,
         source_chart="TradingView visual chart screenshot via persistent Playwright browser",
-        source_data="Graph-first TradingView screenshot + non-blocking fast public quote checks; current=55s, safe_current=75s; Yahoo/Stooq OHLC only in balanced/dated modes + Borsa Istanbul official reference",
+        source_data="Strict TradingView image-first capture; no non-chart visual fallback; quotes are secondary and non-blocking",
         tradingview_url=tv_url,
         screenshot_url=screenshot_url,
         screenshot_base64_png=screenshot_base64,
@@ -711,6 +854,6 @@ async def chart(
         official_reference=official_reference,
         data_status=data_status if records else ("public_quote_fallback" if quote_snapshots else data_status),
         data_note=final_note,
-        performance_note=(("safe_current mode: 75s graph-first visual-safe TradingView capture + Midas/BloombergHT; Yahoo/Stooq skipped unless dated/balanced" if mode == "safe_current" else "current mode: graph-first 55s TradingView visual capture; quotes are non-blocking and slow OHLC is skipped") if mode in {"current", "fast", "safe_current"} else "balanced mode: slower OHLC fallback enabled"),
+        performance_note=(("safe_current mode: strict TradingView-only visual capture; local widget -> widgetembed -> full chart" if mode == "safe_current" else "current mode: strict TradingView-only visual capture; local widget -> widgetembed -> full chart") if mode in {"current", "fast", "safe_current"} else "balanced mode: strict TradingView + slower OHLC fallback enabled"),
         captured_at_utc=datetime.now(timezone.utc).isoformat(),
     )

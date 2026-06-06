@@ -1,8 +1,8 @@
-BIST chart action usage rules:
+Use the chart action for BIST chart requests.
+For current chart requests, call `/chart` with `mode=current`.
+For important/decision-sensitive current chart requests, call `mode=safe_current`.
+For dated or multi-month requests, call `mode=balanced`.
 
-- For current/live chart requests, call /chart with mode=current. This is the default 45-second visual-safe mode.
-- For important current decisions where a little more waiting is acceptable, call mode=safe_current.
-- For dated, historical, 3-month, daily or OHLC-focused analysis, call mode=balanced.
-- Never analyze a screenshot when screenshot_url is null or chart_status indicates loading/timeboxed/no_image.
-- If screenshot_url exists, use the image as the main chart source and quote_snapshots as secondary price verification.
-- Public quote sources can be delayed; mention delay/limitations when relevant.
+Only treat `screenshot_url` as a chart image when `chart_status` begins with `ok_tradingview` or `ok` and the URL is present.
+If `screenshot_url` is null, say the chart image could not be captured and do not perform visual chart analysis.
+Midas/Bloomberg quote data is only secondary price/context verification, never a substitute for a candle chart.
