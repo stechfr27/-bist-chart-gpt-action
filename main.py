@@ -19,12 +19,13 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "3.1.0-warmup-browser-only"
+APP_VERSION = "3.2.0-browserless-remote"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
 QUOTE_CACHE_TTL_SECONDS = int(os.getenv("QUOTE_CACHE_TTL_SECONDS", "180"))
 TRADINGVIEW_COOKIE = os.getenv("TRADINGVIEW_COOKIE", "").strip()
+BROWSERLESS_WS_ENDPOINT = os.getenv("BROWSERLESS_WS_ENDPOINT", "").strip()
 TV_WAIT_CURRENT_MS = int(os.getenv("TV_WAIT_CURRENT_MS", "1200"))
 TV_WAIT_BALANCED_MS = int(os.getenv("TV_WAIT_BALANCED_MS", "9000"))
 TV_CANVAS_WAIT_CURRENT_MS = int(os.getenv("TV_CANVAS_WAIT_CURRENT_MS", "1200"))
@@ -84,18 +85,27 @@ class BrowserManager:
             if self._context:
                 return self._context
             self._pw = await async_playwright().start()
-            self._browser = await self._pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                ],
-            )
             extra_headers = {}
             if TRADINGVIEW_COOKIE:
                 extra_headers["Cookie"] = TRADINGVIEW_COOKIE
+
+            if BROWSERLESS_WS_ENDPOINT:
+                # Remote browser mode: Browserless runs Chromium; this service only drives it.
+                # The endpoint must be stored as a secret env var, e.g.
+                # BROWSERLESS_WS_ENDPOINT=wss://chrome.browserless.io?token=...
+                self._browser = await self._pw.chromium.connect_over_cdp(BROWSERLESS_WS_ENDPOINT, timeout=30000)
+            else:
+                # Local fallback mode for Render/Northflank Docker hosts.
+                self._browser = await self._pw.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-features=IsolateOrigins,site-per-process",
+                    ],
+                )
+
             self._context = await self._browser.new_context(
                 viewport={"width": 1280, "height": 760},
                 device_scale_factor=1,
@@ -170,7 +180,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback"}
 
 @app.get("/warmup")
 async def warmup():
@@ -189,8 +199,9 @@ async def warmup():
             "ok": True,
             "version": APP_VERSION,
             "browser_started_at": BROWSER.started_at,
-            "warmup_mode": "browser_only",
-            "note": "Chromium context is ready. TradingView is intentionally not loaded during warmup; use /chart to test real chart capture."
+            "warmup_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "browser_only",
+            "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT),
+            "note": "Browser context is ready. TradingView is intentionally not loaded during warmup; use /chart to test real chart capture."
         }
     except Exception as e:
         await BROWSER.reset()
@@ -852,7 +863,7 @@ async def chart(
         yahoo_interval_used=YF_INTERVALS.get(interval, "5m"),
         range_hint=range_hint,
         target_date=target_date,
-        source_chart="TradingView visual chart screenshot via persistent Playwright browser",
+        source_chart="TradingView visual chart screenshot via Browserless remote browser if configured, otherwise local Playwright",
         source_data="Strict TradingView image-first capture; no non-chart visual fallback; quotes are secondary and non-blocking",
         tradingview_url=tv_url,
         screenshot_url=screenshot_url,
@@ -864,6 +875,6 @@ async def chart(
         official_reference=official_reference,
         data_status=data_status if records else ("public_quote_fallback" if quote_snapshots else data_status),
         data_note=final_note,
-        performance_note=(("safe_current mode: strict TradingView-only visual capture; local widget -> widgetembed -> full chart" if mode == "safe_current" else "current mode: strict TradingView-only visual capture; local widget -> widgetembed -> full chart") if mode in {"current", "fast", "safe_current"} else "balanced mode: strict TradingView + slower OHLC fallback enabled"),
+        performance_note=(("browserless remote + " if BROWSERLESS_WS_ENDPOINT else "local browser + ") + ("safe_current mode: strict TradingView-only visual capture; local widget -> widgetembed -> full chart" if mode == "safe_current" else "current mode: strict TradingView-only visual capture; local widget -> widgetembed -> full chart") if mode in {"current", "fast", "safe_current"} else "balanced mode: strict TradingView + slower OHLC fallback enabled"),
         captured_at_utc=datetime.now(timezone.utc).isoformat(),
     )

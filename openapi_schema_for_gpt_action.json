@@ -1,8 +1,8 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "BIST Chart GPT Action API",
-    "version": "3.0.0"
+    "title": "BIST Chart GPT Action API v3.2 Browserless",
+    "version": "3.2.0"
   },
   "servers": [
     {

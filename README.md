@@ -1,27 +1,41 @@
-# BIST Chart GPT Action API v3.0
+# BIST Chart GPT Action API v3.2
 
-Strict graph-first version.
+Strict TradingView chart screenshot service for ChatGPT Actions.
 
-## Core rule
-The `/chart` endpoint returns only a verified TradingView chart screenshot as `screenshot_url`.
-It does not return Midas/Bloomberg/other public pages as a chart image.
-It also rejects blank/loading TradingView screenshots.
+## New in v3.2
 
-## Capture order
-1. Local minimal TradingView Advanced Chart Widget HTML
-2. Official TradingView widgetembed
-3. Full TradingView chart page
+- Optional Browserless remote browser support.
+- Set `BROWSERLESS_WS_ENDPOINT` as a secret environment variable.
+- If configured, the API uses Browserless Chrome via Playwright CDP.
+- If not configured, it falls back to local Chromium.
+- `/warmup` only starts the browser/context; it does not load TradingView.
+- `/chart` remains strict: no loading/blank screenshot and no non-chart visual fallback.
 
-## Modes
-- `mode=current`: fastest current-chart mode.
-- `mode=safe_current`: longer strict TradingView capture for important checks.
-- `mode=balanced`: slower historical/OHLC helper mode.
+## Required env vars
 
-If all strict TradingView capture paths fail on Render, `screenshot_url` remains null and `chart_status` explains why. This is deliberate: the service will not fake a chart with a non-chart fallback.
+```text
+PORT=10000
+PYTHONUNBUFFERED=1
+BROWSERLESS_WS_ENDPOINT=wss://chrome.browserless.io?token=YOUR_TOKEN
+```
 
-## Useful endpoints
-- `/health`
-- `/warmup`
-- `/chart?symbol=THYAO&interval=5m&mode=current`
-- `/screenshots-list`
-- `/screenshots-clear`
+Do not put the Browserless token in GitHub files. Add it only in Render/Northflank environment variables or secrets.
+
+## Test order
+
+```text
+/health
+/warmup
+/chart?symbol=THYAO&interval=5m&mode=current
+```
+
+A successful Browserless setup should show:
+
+```json
+{
+  "browserless_configured": true,
+  "browser_mode": "browserless_remote"
+}
+```
+
+For real chart success, `/chart` should return `screenshot_url` and a TradingView chart status.
