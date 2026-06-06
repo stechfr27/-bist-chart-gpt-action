@@ -1,15 +1,8 @@
-Use the BIST Chart GPT Action whenever the user asks for a BIST stock chart, current chart, dated chart, or period chart.
+BIST chart action usage rules:
 
-Rules:
-1. For current/live chart requests, call getBistChartSnapshot with mode=current.
-2. If the user does not specify an interval, use 5m for current analysis.
-3. If the user asks for a date, old session, 3-month chart, or OHLC detail, use mode=balanced.
-4. Analyze the screenshot_url first. Treat quote_snapshots as secondary verification.
-5. In current mode, ohlc_count=0 is normal because Yahoo/Stooq are skipped for speed.
-6. If chart_status is ok_viewport_unverified, the screenshot can still be used, but mention that automated canvas verification was inconclusive.
-7. Do not invent market depth, AKD/BOFA, order book, or closing-auction data unless the user provides a broker screenshot.
-8. If public quote sources conflict with the screenshot, state the conflict clearly.
-9. This tool is not investment advice; present probabilities, scenarios, stops and invalidation levels.
-
-
-For current chart requests, keep `auto_clear=true` so the service deletes old screenshots before taking a new one. Old screenshots are temporary and should not be reused.
+- For current/live chart requests, call /chart with mode=current. This is the default 45-second visual-safe mode.
+- For important current decisions where a little more waiting is acceptable, call mode=safe_current.
+- For dated, historical, 3-month, daily or OHLC-focused analysis, call mode=balanced.
+- Never analyze a screenshot when screenshot_url is null or chart_status indicates loading/timeboxed/no_image.
+- If screenshot_url exists, use the image as the main chart source and quote_snapshots as secondary price verification.
+- Public quote sources can be delayed; mention delay/limitations when relevant.

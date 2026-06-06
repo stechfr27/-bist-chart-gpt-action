@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BIST Chart GPT Action API",
-    "version": "2.3.0-auto-clear-screenshots",
-    "description": "Fast current TradingView screenshot and public quote verification for BIST stocks. Balanced mode can use Yahoo/Stooq OHLC fallbacks."
+    "version": "2.5.0",
+    "description": "BIST chart screenshot API. current=45s safe-fast; safe_current=60s; balanced=historical/OHLC."
   },
   "servers": [
     {
@@ -105,11 +105,12 @@
               "default": "current",
               "enum": [
                 "current",
-                "fast",
-                "balanced"
+                "safe_current",
+                "balanced",
+                "fast"
               ]
             },
-            "description": "current: fastest live chart mode. balanced: slower OHLC fallback mode."
+            "description": "current (default, 45s safe-fast), safe_current (60s safer), balanced (historical/OHLC), fast (legacy)"
           }
         ],
         "responses": {
