@@ -19,7 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "4.0.0-bist-session-timebox"
+APP_VERSION = "4.1.0-fullscreen-hover-last-candle"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -56,6 +56,15 @@ CHART_CLIP_HEIGHT_RATIO = float(os.getenv("CHART_CLIP_HEIGHT_RATIO", "0.985"))
 SESSION_LEFT_CROP_RATIO = float(os.getenv("SESSION_LEFT_CROP_RATIO", "0.36"))
 BIST_SESSION_START = os.getenv("BIST_SESSION_START", "09:55")
 BIST_SESSION_END = os.getenv("BIST_SESSION_END", "18:10")
+
+# TradingView UI adjustment: try to maximize graph area and place the crosshair just above
+# the latest candle column so TradingView's top legend/volume reflects the last candle.
+TV_FORCE_FULLSCREEN = os.getenv("TV_FORCE_FULLSCREEN", "true").lower() in {"1", "true", "yes", "on"}
+TV_FULLSCREEN_SHORTCUT = os.getenv("TV_FULLSCREEN_SHORTCUT", "Shift+F")
+TV_HOVER_LAST_CANDLE = os.getenv("TV_HOVER_LAST_CANDLE", "true").lower() in {"1", "true", "yes", "on"}
+TV_CLICK_LAST_CANDLE_COLUMN = os.getenv("TV_CLICK_LAST_CANDLE_COLUMN", "true").lower() in {"1", "true", "yes", "on"}
+TV_LAST_CANDLE_X_RATIO = float(os.getenv("TV_LAST_CANDLE_X_RATIO", "0.955"))
+TV_LAST_CANDLE_Y_RATIO = float(os.getenv("TV_LAST_CANDLE_Y_RATIO", "0.52"))
 
 TV_INTERVALS = {"1m": "1", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "1h": "60", "1d": "D"}
 YF_INTERVALS = {"1m": "1m", "3m": "5m", "5m": "5m", "10m": "15m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d"}
@@ -194,7 +203,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END}}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO}}
 
 @app.get("/warmup")
 async def warmup():
@@ -405,6 +414,68 @@ async def apply_session_view_controls(page: Page, view: str, target_date: Option
     except Exception:
         pass
 
+
+async def try_tradingview_fullscreen(page: Page):
+    """Best-effort TradingView fullscreen/expand action.
+
+    This is intentionally soft: if TradingView refuses the click/shortcut in a
+    headless Browserless session, capture continues. The goal is to maximize the
+    chart canvas, not to accept any non-chart fallback.
+    """
+    if not TV_FORCE_FULLSCREEN:
+        return
+    selectors = [
+        "button[data-name='fullscreen-button']",
+        "button[aria-label*='Full screen' i]",
+        "button[aria-label*='Fullscreen' i]",
+        "button[aria-label*='Tam ekran' i]",
+        "div[data-name='fullscreen-button']",
+        "[data-name='header-toolbar-fullscreen']",
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=500):
+                await loc.click(timeout=700)
+                await page.wait_for_timeout(1000)
+                return
+        except Exception:
+            pass
+    # Keyboard fallback. TradingView commonly supports a fullscreen/expand shortcut.
+    try:
+        await page.keyboard.press(TV_FULLSCREEN_SHORTCUT)
+        await page.wait_for_timeout(1000)
+    except Exception:
+        pass
+
+async def hover_latest_candle_column(page: Page):
+    """Move/click one tick above the latest visible candle column.
+
+    TradingView updates the top OHLC/volume legend from the crosshair position.
+    We click slightly above the final candle body rather than on the candle so the
+    candle/volume information is visible without accidentally selecting/drawing.
+    """
+    if not TV_HOVER_LAST_CANDLE:
+        return
+    try:
+        # Use the clipped chart width when chart-only screenshots are enabled, so the
+        # crosshair lands inside the captured area and not on the hidden sidebar.
+        right_edge = max(900, int(TV_VIEWPORT_WIDTH * CHART_CLIP_WIDTH_RATIO)) if CHART_ONLY_SCREENSHOT else TV_VIEWPORT_WIDTH
+        left_crop = int(right_edge * SESSION_LEFT_CROP_RATIO) if (CHART_ONLY_SCREENSHOT and SESSION_LEFT_CROP_RATIO > 0) else 0
+        left_crop = max(0, min(left_crop, right_edge - 850)) if CHART_ONLY_SCREENSHOT else 0
+        capture_width = max(800, right_edge - left_crop) if CHART_ONLY_SCREENSHOT else TV_VIEWPORT_WIDTH
+        x = int(left_crop + capture_width * TV_LAST_CANDLE_X_RATIO)
+        y = int(TV_VIEWPORT_HEIGHT * TV_LAST_CANDLE_Y_RATIO)
+        await page.mouse.move(x, y)
+        await page.wait_for_timeout(350)
+        if TV_CLICK_LAST_CANDLE_COLUMN:
+            await page.mouse.click(x, y)
+            await page.wait_for_timeout(450)
+        await page.mouse.move(x, y)
+        await page.wait_for_timeout(450)
+    except Exception:
+        pass
+
 async def page_has_tradingview_symbol_error(page: Page) -> tuple[bool, str]:
     """Detect TradingView pages/widgets that loaded UI but not the requested chart.
     This prevents returning screenshots of "symbol unavailable" / loading / notification screens.
@@ -511,6 +582,8 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
         await page.goto(url, wait_until="domcontentloaded", timeout=45000 if mode == "safe_current" else (28000 if mode in {"current", "fast"} else 55000))
         await click_soft_popups(page)
         await apply_session_view_controls(page, view, target_date)
+        await try_tradingview_fullscreen(page)
+        await hover_latest_candle_column(page)
         base_wait = (2200 if mode == "safe_current" else TV_WAIT_CURRENT_MS) if mode in {"current", "fast", "safe_current"} else TV_WAIT_BALANCED_MS
         canvas_wait = (1500 if mode == "safe_current" else TV_CANVAS_WAIT_CURRENT_MS) if mode in {"current", "fast", "safe_current"} else TV_CANVAS_WAIT_BALANCED_MS
         max_attempts = 5 if mode == "safe_current" else (3 if mode in {"current", "fast"} else 5)
@@ -531,6 +604,7 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
                     last_validation_note = f"attempt {attempt}: {tv_error_note}"
                     # Do not keep this screenshot/candidate; continue to next TradingView path.
                     break
+                await hover_latest_candle_column(page)
                 verified_image = await capture_and_validate(page, out_path, img_type, 78 if img_type == "jpeg" else 0)
                 if verified_image:
                     # Re-check after screenshot; some widgets show an error modal after canvas boot.
@@ -1002,7 +1076,7 @@ async def chart(
         yahoo_interval_used=YF_INTERVALS.get(interval, "5m"),
         range_hint=range_hint,
         target_date=target_date,
-        source_chart="TradingView visual chart screenshot via Browserless remote browser if configured, otherwise local Playwright; latest-session crop excludes the right info panel and trims older sessions on the left for a clearer current-day view",
+        source_chart="TradingView visual chart screenshot via Browserless remote browser if configured, otherwise local Playwright; chart-only capture can force TradingView fullscreen and place the crosshair just above the latest candle so top legend/volume values are visible",
         source_data="Strict TradingView image-first capture with session-tight-fit chart-only capture; Midas/BloombergHT provide external market info; no non-chart visual fallback; quotes are secondary and non-blocking",
         tradingview_url=tv_url,
         screenshot_url=screenshot_url,
