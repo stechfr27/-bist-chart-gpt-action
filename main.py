@@ -19,7 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "5.2.0-range-core-stabilized"
+APP_VERSION = "5.3.0-range-core-debug-budgeted"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -36,10 +36,10 @@ HTTP_TIMEOUT_CURRENT = int(os.getenv("HTTP_TIMEOUT_CURRENT", "2"))
 HTTP_TIMEOUT_BALANCED = int(os.getenv("HTTP_TIMEOUT_BALANCED", "7"))
 AUTO_CLEAR_SCREENSHOTS = os.getenv("AUTO_CLEAR_SCREENSHOTS", "true").lower() in {"1", "true", "yes", "on"}
 SCREENSHOT_KEEP_LAST = int(os.getenv("SCREENSHOT_KEEP_LAST", "0"))
-TV_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_CURRENT_HARD_TIMEOUT_SECONDS", "55"))
+TV_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_CURRENT_HARD_TIMEOUT_SECONDS", "58"))
 TV_BALANCED_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_BALANCED_HARD_TIMEOUT_SECONDS", "115"))
 QUOTE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("QUOTE_CURRENT_HARD_TIMEOUT_SECONDS", "2"))
-TOTAL_CHART_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_CHART_HARD_TIMEOUT_SECONDS", "58"))
+TOTAL_CHART_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_CHART_HARD_TIMEOUT_SECONDS", "60"))
 TV_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TV_SAFE_CURRENT_HARD_TIMEOUT_SECONDS", "75"))
 TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_SAFE_CURRENT_HARD_TIMEOUT_SECONDS", "80"))
 TOTAL_BALANCED_HARD_TIMEOUT_SECONDS = int(os.getenv("TOTAL_BALANCED_HARD_TIMEOUT_SECONDS", "115"))
@@ -54,12 +54,12 @@ CHART_CLIP_HEIGHT_RATIO = float(os.getenv("CHART_CLIP_HEIGHT_RATIO", "1.00"))
 # For BIST current/session screenshots, crop out older sessions on the left so the latest trading day is wider.
 # 0.0 = no left crop. Typical values: 0.30-0.42. Default tuned from THYAO 5m tests.
 SESSION_LEFT_CROP_RATIO = float(os.getenv("SESSION_LEFT_CROP_RATIO", "0.00"))
-BIST_SESSION_START = os.getenv("BIST_SESSION_START", "09:45")
+BIST_SESSION_START = os.getenv("BIST_SESSION_START", "09:55")
 BIST_SESSION_END = os.getenv("BIST_SESSION_END", "18:10")
-BIST_SESSION_STRICT_NOTE = "BIST 5m session target is 09:45-18:10. For current requests, end target is current Istanbul time +1 minute, capped at 18:10. The system must not claim exact full-session coverage unless the x-axis visually shows that band."
+BIST_SESSION_STRICT_NOTE = "BIST 5m session target is 09:55-18:10. For current requests, end target is current Istanbul time +1 minute, capped at 18:10. The system must not claim exact full-session coverage unless the x-axis visually shows that band."
 TV_USE_CUSTOM_RANGE = os.getenv("TV_USE_CUSTOM_RANGE", "true").lower() in {"1", "true", "yes", "on"}
 TV_CUSTOM_RANGE_CORE = os.getenv("TV_CUSTOM_RANGE_CORE", "true").lower() in {"1", "true", "yes", "on"}
-TV_CUSTOM_RANGE_MAX_SECONDS = int(os.getenv("TV_CUSTOM_RANGE_MAX_SECONDS", "16"))
+TV_CUSTOM_RANGE_MAX_SECONDS = int(os.getenv("TV_CUSTOM_RANGE_MAX_SECONDS", "11"))
 TV_CUSTOM_RANGE_START = os.getenv("TV_CUSTOM_RANGE_START", BIST_SESSION_START)
 TV_CUSTOM_RANGE_END = os.getenv("TV_CUSTOM_RANGE_END", BIST_SESSION_END)
 TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES = int(os.getenv("TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES", "1"))
@@ -398,8 +398,8 @@ def _parse_hhmm(value: str) -> tuple[int, int]:
 def build_target_session_window(target_date: Optional[str]) -> dict:
     """Build the user's requested BIST session window.
 
-    Current request: 09:45 -> Istanbul now +1m, capped at 18:10.
-    Historical target_date: 09:45 -> 18:10 for that date.
+    Current request: 09:55 -> Istanbul now +1m, capped at 18:10.
+    Historical target_date: 09:55 -> 18:10 for that date.
     """
     now_tr = get_istanbul_now()
     sh, sm = _parse_hhmm(TV_CUSTOM_RANGE_START)
@@ -429,108 +429,160 @@ def build_target_session_window(target_date: Optional[str]) -> dict:
     }
 
 async def try_tradingview_custom_date_range(page: Page, target_date: Optional[str], view: str) -> str:
-    """Best-effort use of TradingView's built-in custom date range control.
+    """Core range engine for BIST exact-session attempts.
 
-    This is intentionally defensive. TradingView changes selectors often, so the API
-    must continue even when the control cannot be automated. It tries to open the
-    bottom date-range/calendar control, select custom range, fill start/end fields,
-    and confirm.
+    Current request target: today's 09:55 -> Istanbul now +1 minute, capped at 18:10.
+    Historical request target: target_date 09:55 -> 18:10.
+
+    This function is deliberately stage-logged. TradingView's public UI is not stable,
+    so every step reports where it reached: open_range_menu, choose_custom_range,
+    fill_start_end, apply, reload_wait. The API must not pretend the range succeeded
+    unless the chart image later verifies visually.
     """
     if not TV_USE_CUSTOM_RANGE or view not in {"session", "full_day", "day"}:
-        return "custom range skipped"
+        return "range_attempt enabled=false stage=skipped reason=not_session_view"
+
     window = build_target_session_window(target_date)
-    notes = [f"target session range {window['start_label']} -> {window['end_label']}"]
+    notes = [
+        "range_attempt enabled=true core=true",
+        f"target_start={window['start_label']}",
+        f"target_end={window['end_label']}",
+        "rule=current_uses_istanbul_now_plus_1m_capped_18_10; historical_uses_09_55_to_18_10"
+    ]
+
+    def add(stage: str, ok: bool, detail: str = ""):
+        notes.append(f"stage={stage} ok={str(ok).lower()}" + (f" detail={detail}" if detail else ""))
+
     try:
         await page.keyboard.press("Escape")
-        await page.wait_for_timeout(150)
+        await page.wait_for_timeout(120)
     except Exception:
         pass
-    # First click the bottom date-range/calendar button area if visible.
-    candidates = [
-        "button[aria-label*='Date Range' i]", "button[aria-label*='Tarih' i]", "button[aria-label*='Takvim' i]",
-        "button:has-text('Tümü')", "button:has-text('Tüm')", "button:has-text('1G')", "button:has-text('1D')",
-        "[data-name*='date' i]", "[data-name*='range' i]", "[data-name*='go-to-date' i]",
-    ]
+
+    # 1) Open the bottom-left/date-range control. Prefer coordinate path because the user
+    # specifically wants the TradingView bottom-left special/custom range selector.
     opened = False
-    for sel in candidates:
+    open_errors = []
+    coordinate_points = [
+        (250, TV_VIEWPORT_HEIGHT - 34),
+        (320, TV_VIEWPORT_HEIGHT - 34),
+        (410, TV_VIEWPORT_HEIGHT - 34),
+        (520, TV_VIEWPORT_HEIGHT - 34),
+    ]
+    for x, y in coordinate_points:
         try:
-            loc = page.locator(sel).last
-            if await loc.is_visible(timeout=450):
-                await loc.click(timeout=700)
-                await page.wait_for_timeout(700)
-                opened = True
-                notes.append(f"opened range control via {sel}")
-                break
-        except Exception:
-            pass
-    if not opened:
-        # Coordinate fallback: bottom-left range toolbar / calendar area.
-        try:
-            await page.mouse.click(335, TV_VIEWPORT_HEIGHT - 36)
-            await page.wait_for_timeout(700)
+            await page.mouse.click(x, y)
+            await page.wait_for_timeout(650)
             opened = True
-            notes.append("opened range control via bottom-left coordinate fallback")
+            add("open_range_menu", True, f"coordinate={x},{y}")
+            break
         except Exception as e:
-            notes.append(f"range control open failed: {type(e).__name__}")
+            open_errors.append(f"coord_{x}_{y}:{type(e).__name__}")
+
     if not opened:
+        candidates = [
+            "button[aria-label*='Date Range' i]", "button[aria-label*='Tarih' i]", "button[aria-label*='Takvim' i]",
+            "button[aria-label*='Go to' i]", "button[aria-label*='Git' i]",
+            "[data-name*='date' i]", "[data-name*='range' i]", "[data-name*='go-to-date' i]",
+            "button:has-text('1G')", "button:has-text('1D')", "span:has-text('1G')", "span:has-text('1D')",
+        ]
+        for sel in candidates:
+            try:
+                loc = page.locator(sel).last
+                if await loc.is_visible(timeout=350):
+                    await loc.click(timeout=600)
+                    await page.wait_for_timeout(650)
+                    opened = True
+                    add("open_range_menu", True, f"selector={sel}")
+                    break
+            except Exception as e:
+                open_errors.append(f"{sel}:{type(e).__name__}")
+
+    if not opened:
+        add("open_range_menu", False, ";".join(open_errors[:5]))
         return " | ".join(notes)
-    # Click custom range item if present.
-    custom_texts = ["Özel aralık", "Ozel aralik", "Custom range", "Özel", "Custom"]
+
+    # 2) Choose Custom Range / Special Range.
+    clicked_custom = False
+    custom_texts = ["Özel aralık", "Ozel aralik", "Özel aralığı", "Custom range", "Custom Range", "Özel", "Custom"]
     for txt in custom_texts:
         try:
-            await page.get_by_text(txt, exact=False).first.click(timeout=900)
-            await page.wait_for_timeout(700)
-            notes.append(f"clicked custom range text: {txt}")
+            await page.get_by_text(txt, exact=False).first.click(timeout=750)
+            await page.wait_for_timeout(500)
+            clicked_custom = True
+            add("choose_custom_range", True, f"text={txt}")
             break
         except Exception:
             pass
-    # Fill visible text/date inputs. We try a few common formats; TradingView accepts different formats by locale.
-    values = [
-        window["start"].strftime("%d.%m.%Y %H:%M"),
-        window["end"].strftime("%d.%m.%Y %H:%M"),
-        window["start"].strftime("%Y-%m-%d %H:%M"),
-        window["end"].strftime("%Y-%m-%d %H:%M"),
+    if not clicked_custom:
+        # Some locales open the date input directly; don't fail yet.
+        add("choose_custom_range", False, "custom_text_not_found; will_try_visible_inputs_anyway")
+
+    # 3) Fill start/end inputs. Try several format pairs because TradingView locale differs.
+    format_pairs = [
+        (window["start"].strftime("%d.%m.%Y %H:%M"), window["end"].strftime("%d.%m.%Y %H:%M")),
+        (window["start"].strftime("%Y-%m-%d %H:%M"), window["end"].strftime("%Y-%m-%d %H:%M")),
+        (window["start"].strftime("%m/%d/%Y %H:%M"), window["end"].strftime("%m/%d/%Y %H:%M")),
+        (window["start"].strftime("%d/%m/%Y %H:%M"), window["end"].strftime("%d/%m/%Y %H:%M")),
     ]
+    filled = False
+    input_count = 0
     try:
         inputs = page.locator("input")
-        count = min(await inputs.count(), 6)
-        if count >= 2:
-            # Prefer first two writable inputs.
+        input_count = await inputs.count()
+        count = min(input_count, 8)
+        # Prefer visible writable inputs from left/top order. Fill first two only.
+        for start_val, end_val in format_pairs:
             written = 0
             for i in range(count):
                 if written >= 2:
                     break
                 try:
                     inp = inputs.nth(i)
-                    if await inp.is_visible(timeout=250):
-                        await inp.click(timeout=500)
+                    if await inp.is_visible(timeout=220):
+                        await inp.click(timeout=450)
                         await page.keyboard.press("Control+A")
-                        await page.keyboard.type(values[written], delay=15)
+                        await page.keyboard.press("Backspace")
+                        await page.keyboard.type(start_val if written == 0 else end_val, delay=8)
                         written += 1
-                        await page.wait_for_timeout(120)
+                        await page.wait_for_timeout(90)
                 except Exception:
                     pass
-            notes.append(f"filled {written} custom range input(s)")
+            if written >= 2:
+                filled = True
+                add("fill_start_end", True, f"format_pair={start_val}->{end_val}; input_count={input_count}")
+                break
     except Exception as e:
-        notes.append(f"input fill failed: {type(e).__name__}")
-    # Confirm/apply.
-    apply_texts = ["Uygula", "Tamam", "Apply", "OK", "Done"]
+        add("fill_start_end", False, f"{type(e).__name__}: {e}")
+    if not filled:
+        add("fill_start_end", False, f"input_count={input_count}")
+
+    # 4) Apply.
     clicked_apply = False
-    for txt in apply_texts:
+    for txt in ["Uygula", "Tamam", "Apply", "OK", "Done", "Git", "Go"]:
         try:
-            await page.get_by_text(txt, exact=False).last.click(timeout=800)
+            await page.get_by_text(txt, exact=False).last.click(timeout=650)
             clicked_apply = True
-            notes.append(f"clicked apply text: {txt}")
+            add("apply_range", True, f"text={txt}")
             break
         except Exception:
             pass
     if not clicked_apply:
         try:
             await page.keyboard.press("Enter")
-            notes.append("pressed Enter to apply custom range")
-        except Exception:
-            pass
-    await page.wait_for_timeout(1600)
+            clicked_apply = True
+            add("apply_range", True, "keyboard_enter")
+        except Exception as e:
+            add("apply_range", False, f"{type(e).__name__}: {e}")
+
+    # 5) Give TradingView a very short reload budget. Browserless free sessions are short;
+    # if this doesn't apply quickly, the screenshot step should continue and report failure.
+    try:
+        await page.wait_for_timeout(1800)
+        add("reload_wait", True, "waited=1800ms")
+    except Exception as e:
+        add("reload_wait", False, f"{type(e).__name__}: {e}")
+
     return " | ".join(notes)
 
 async def detect_latest_candle_point_from_page(page: Page) -> Optional[tuple[int, int, str]]:
@@ -606,10 +658,13 @@ async def apply_session_view_controls(page: Page, view: str, target_date: Option
     # target_date = 09:45 -> 18:10. This is best-effort because TradingView changes UI selectors.
     try:
         custom_note = await asyncio.wait_for(try_tradingview_custom_date_range(page, target_date, view), timeout=TV_CUSTOM_RANGE_MAX_SECONDS)
+        setattr(page, "_bist_custom_range_note", custom_note)
     except asyncio.TimeoutError:
         custom_note = f"custom range core attempt timeboxed at {TV_CUSTOM_RANGE_MAX_SECONDS}s"
+        setattr(page, "_bist_custom_range_note", custom_note)
     except Exception as e:
         custom_note = f"custom range core attempt failed: {type(e).__name__}: {e}"
+        setattr(page, "_bist_custom_range_note", custom_note)
     # TradingView range=1D often means "last 24h", which can show the previous session too.
     # For BIST intraday analysis the user needs the latest regular session (open->close)
     # readable, not two days compressed. Zoom around the right side of the chart so the
@@ -860,7 +915,8 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
                         last_validation_note = f"attempt {attempt}: rejected after screenshot: {tv_error_note}"
                         break
                     status = "ok" if canvas_found else "ok_visual_verified"
-                    note = f"TradingView {source_kind} screenshot captured and visual content check passed; no symbol/error overlay detected."
+                    range_note = getattr(page, "_bist_custom_range_note", "range_attempt note_missing")
+                    note = f"TradingView {source_kind} screenshot captured and visual content check passed; no symbol/error overlay detected. | {range_note}"
                     return out_path, f"/screenshots/{filename}", status, note
                 last_validation_note = f"attempt {attempt}: image looked blank/loading"
             except Exception as shot_error:
@@ -870,14 +926,16 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
                 out_path.unlink()
         except Exception:
             pass
-        return None, None, "chart_loading_not_captured", f"TradingView {source_kind} did not pass validation; blank/loading/symbol-error image was rejected. {last_validation_note}"
+        range_note = getattr(page, "_bist_custom_range_note", "range_attempt note_missing")
+        return None, None, "chart_loading_not_captured", f"TradingView {source_kind} did not pass validation; blank/loading/symbol-error image was rejected. {last_validation_note} | {range_note}"
     except Exception as e:
         try:
             if out_path.exists():
                 out_path.unlink()
         except Exception:
             pass
-        return None, None, "chart_failed_data_only", f"TradingView {source_kind} screenshot failed. Error: {type(e).__name__}: {e}"
+        range_note = getattr(page, "_bist_custom_range_note", "range_attempt note_missing") if page else "range_attempt page_not_created"
+        return None, None, "chart_failed_data_only", f"TradingView {source_kind} screenshot failed. Error: {type(e).__name__}: {e} | {range_note}"
     finally:
         try:
             if page:

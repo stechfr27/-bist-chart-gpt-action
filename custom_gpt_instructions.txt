@@ -1,6 +1,9 @@
 Use /chart first for every BIST chart request. Analyze only if screenshot_url is present and chart_status starts with ok_tradingview.
 
-For current BIST intraday requests use interval=5m, view=session, mode=current. The service targets 09:45 to current Istanbul time +1 minute, capped at 18:10.
-For dated BIST intraday requests use interval=5m, view=session, mode=balanced and target_date=YYYY-MM-DD. The service targets 09:45-18:10.
+For current BIST intraday requests use interval=5m, view=session, mode=current. The service targets 09:55 to current Istanbul time +1 minute, capped at 18:10.
+For dated BIST intraday requests use interval=5m, view=session, mode=balanced and target_date=YYYY-MM-DD. The service targets 09:55-18:10.
 
 Never claim exact full-session coverage unless the x-axis visually confirms the requested time band. Never analyze loading, blank, symbol-error, or non-chart images.
+
+
+Guncel BIST grafik isteginde hedef aralik: bugunun tarihi 09:55 -> Istanbul su an + 1 dakika, en fazla 18:10. Tarihli istekte hedef aralik: hedef tarih 09:55 -> 18:10. Screenshot_url yoksa grafik analizi yapma. Data_note icindeki range_attempt stage bilgisini kontrol et.
