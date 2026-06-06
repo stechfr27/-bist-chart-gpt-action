@@ -10,16 +10,22 @@ import asyncio
 from PIL import Image
 from typing import Optional
 
-import pandas as pd
+try:
+    import pandas as pd
+except Exception:  # optional in graph-only runtime/tests
+    pd = None
 import requests
-import yfinance as yf
+try:
+    import yfinance as yf
+except Exception:  # optional; graph-only endpoint does not call Yahoo
+    yf = None
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "5.5.0-graph-only-range-core"
+APP_VERSION = "5.7.0-graph-only-selftested-range-first"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -28,9 +34,9 @@ TRADINGVIEW_COOKIE = os.getenv("TRADINGVIEW_COOKIE", "").strip()
 BROWSERLESS_WS_ENDPOINT = os.getenv("BROWSERLESS_WS_ENDPOINT", "").strip()
 TV_VIEWPORT_WIDTH = int(os.getenv("TV_VIEWPORT_WIDTH", "2400"))
 TV_VIEWPORT_HEIGHT = int(os.getenv("TV_VIEWPORT_HEIGHT", "1350"))
-TV_WAIT_CURRENT_MS = int(os.getenv("TV_WAIT_CURRENT_MS", "1200"))
+TV_WAIT_CURRENT_MS = int(os.getenv("TV_WAIT_CURRENT_MS", "650"))
 TV_WAIT_BALANCED_MS = int(os.getenv("TV_WAIT_BALANCED_MS", "9000"))
-TV_CANVAS_WAIT_CURRENT_MS = int(os.getenv("TV_CANVAS_WAIT_CURRENT_MS", "1200"))
+TV_CANVAS_WAIT_CURRENT_MS = int(os.getenv("TV_CANVAS_WAIT_CURRENT_MS", "650"))
 TV_CANVAS_WAIT_BALANCED_MS = int(os.getenv("TV_CANVAS_WAIT_BALANCED_MS", "9000"))
 HTTP_TIMEOUT_CURRENT = int(os.getenv("HTTP_TIMEOUT_CURRENT", "2"))
 HTTP_TIMEOUT_BALANCED = int(os.getenv("HTTP_TIMEOUT_BALANCED", "7"))
@@ -59,7 +65,7 @@ BIST_SESSION_END = os.getenv("BIST_SESSION_END", "18:10")
 BIST_SESSION_STRICT_NOTE = "BIST 5m session target is 09:55-18:10. For current requests, end target is current Istanbul time +1 minute, capped at 18:10. The system must not claim exact full-session coverage unless the x-axis visually shows that band."
 TV_USE_CUSTOM_RANGE = os.getenv("TV_USE_CUSTOM_RANGE", "true").lower() in {"1", "true", "yes", "on"}
 TV_CUSTOM_RANGE_CORE = os.getenv("TV_CUSTOM_RANGE_CORE", "true").lower() in {"1", "true", "yes", "on"}
-TV_CUSTOM_RANGE_MAX_SECONDS = int(os.getenv("TV_CUSTOM_RANGE_MAX_SECONDS", "11"))
+TV_CUSTOM_RANGE_MAX_SECONDS = int(os.getenv("TV_CUSTOM_RANGE_MAX_SECONDS", "14"))
 TV_CUSTOM_RANGE_START = os.getenv("TV_CUSTOM_RANGE_START", BIST_SESSION_START)
 TV_CUSTOM_RANGE_END = os.getenv("TV_CUSTOM_RANGE_END", BIST_SESSION_END)
 TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES = int(os.getenv("TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES", "1"))
@@ -213,6 +219,27 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END, "strict_note": BIST_SESSION_STRICT_NOTE}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO, "image_detect_last_candle": TV_IMAGE_DETECT_LAST_CANDLE}, "custom_range": {"enabled": TV_USE_CUSTOM_RANGE, "core": TV_CUSTOM_RANGE_CORE, "max_seconds": TV_CUSTOM_RANGE_MAX_SECONDS, "session_start": TV_CUSTOM_RANGE_START, "session_end": TV_CUSTOM_RANGE_END, "current_plus_minutes": TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES, "range_attempt_json": True}}
+
+@app.get("/debug/range-target")
+async def debug_range_target(target_date: Optional[str] = None, view: str = "session"):
+    """Dry-run the BIST session target calculation without opening TradingView.
+    Useful before spending Browserless units.
+    """
+    if view not in {"session", "full_day", "day", "auto"}:
+        raise HTTPException(status_code=400, detail="view session, full_day, day veya auto olmali.")
+    window = build_target_session_window(target_date)
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "view": view,
+        "target_date": target_date,
+        "target_start": window["start_label"],
+        "target_end": window["end_label"],
+        "session_start": TV_CUSTOM_RANGE_START,
+        "session_end": TV_CUSTOM_RANGE_END,
+        "current_plus_minutes": TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES,
+        "strict_rule": "current: today 09:55 -> Istanbul now +1m capped 18:10; historical: target date 09:55 -> 18:10; 5m only",
+    }
 
 @app.get("/warmup")
 async def warmup():
@@ -924,16 +951,30 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
             else:
                 raise
         await install_fast_routes(page)
-        page.set_default_timeout(8000 if mode == "safe_current" else (5000 if mode in {"current", "fast"} else 12000))
-        page.set_default_navigation_timeout(45000 if mode == "safe_current" else (28000 if mode in {"current", "fast"} else 55000))
-        await page.goto(url, wait_until="domcontentloaded", timeout=45000 if mode == "safe_current" else (28000 if mode in {"current", "fast"} else 55000))
+        page.set_default_timeout(8000 if mode == "safe_current" else (4500 if mode in {"current", "fast"} else 12000))
+        # v5.7: range-first/no-prewait. Full TradingView can spend the whole Browserless
+        # free-session budget just waiting for DOM/canvas. For session charts, stop waiting
+        # early, then immediately try the custom range UI. A partially loaded page is still
+        # useful if the bottom range control exists.
+        nav_timeout = 45000 if mode == "safe_current" else (28000 if mode in {"current", "fast"} else 55000)
+        if source_kind == "full" and mode in {"current", "fast"} and view in {"session", "full_day", "day"}:
+            nav_timeout = int(os.getenv("TV_RANGE_FIRST_GOTO_TIMEOUT_MS", "12000"))
+        page.set_default_navigation_timeout(nav_timeout)
+        goto_note = ""
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout)
+            goto_note = f"goto ok timeout_ms={nav_timeout}"
+        except Exception as goto_error:
+            # Continue: TradingView may still have enough DOM for range controls after a nav timeout.
+            goto_note = f"goto soft-failed {type(goto_error).__name__}: {str(goto_error)[:160]}"
+        setattr(page, "_bist_goto_note", goto_note)
         await click_soft_popups(page)
         await apply_session_view_controls(page, view, target_date)
         await try_tradingview_fullscreen(page)
         await hover_latest_candle_column(page)
         base_wait = (2200 if mode == "safe_current" else TV_WAIT_CURRENT_MS) if mode in {"current", "fast", "safe_current"} else TV_WAIT_BALANCED_MS
         canvas_wait = (1500 if mode == "safe_current" else TV_CANVAS_WAIT_CURRENT_MS) if mode in {"current", "fast", "safe_current"} else TV_CANVAS_WAIT_BALANCED_MS
-        max_attempts = 5 if mode == "safe_current" else (3 if mode in {"current", "fast"} else 5)
+        max_attempts = 5 if mode == "safe_current" else (2 if mode in {"current", "fast"} else 5)
         last_validation_note = ""
         for attempt in range(1, max_attempts + 1):
             await page.wait_for_timeout(base_wait if attempt == 1 else (2200 if mode == "safe_current" else (1400 if mode in {"current", "fast"} else 3500)))
@@ -961,7 +1002,8 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
                         break
                     status = "ok" if canvas_found else "ok_visual_verified"
                     range_note = getattr(page, "_bist_custom_range_note", "range_attempt note_missing")
-                    note = f"TradingView {source_kind} screenshot captured and visual content check passed; no symbol/error overlay detected. | {range_note}"
+                    goto_note = getattr(page, "_bist_goto_note", "goto note_missing")
+                    note = f"TradingView {source_kind} screenshot captured and visual content check passed; no symbol/error overlay detected. | {goto_note} | {range_note}"
                     return out_path, f"/screenshots/{filename}", status, note
                 last_validation_note = f"attempt {attempt}: image looked blank/loading"
             except Exception as shot_error:
@@ -972,7 +1014,8 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
         except Exception:
             pass
         range_note = getattr(page, "_bist_custom_range_note", "range_attempt note_missing")
-        return None, None, "chart_loading_not_captured", f"TradingView {source_kind} did not pass validation; blank/loading/symbol-error image was rejected. {last_validation_note} | {range_note}"
+        goto_note = getattr(page, "_bist_goto_note", "goto note_missing")
+        return None, None, "chart_loading_not_captured", f"TradingView {source_kind} did not pass validation; blank/loading/symbol-error image was rejected. {last_validation_note} | {goto_note} | {range_note}"
     except Exception as e:
         try:
             if out_path.exists():
@@ -980,7 +1023,8 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
         except Exception:
             pass
         range_note = getattr(page, "_bist_custom_range_note", "range_attempt note_missing") if page else "range_attempt page_not_created"
-        return None, None, "chart_failed_data_only", f"TradingView {source_kind} screenshot failed. Error: {type(e).__name__}: {e} | {range_note}"
+        goto_note = getattr(page, "_bist_goto_note", "goto note_missing") if page else "goto page_not_created"
+        return None, None, "chart_failed_data_only", f"TradingView {source_kind} screenshot failed. Error: {type(e).__name__}: {e} | {goto_note} | {range_note}"
     finally:
         try:
             if page:
@@ -1087,7 +1131,10 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
                 return out_path, shot_path, "ok_tradingview_widgetembed", note + " | Exact TradingView chart path: official widgetembed; session-zoom view attempts to show the latest BIST session open-to-close with readable 5m candles and chart area; external quote fields provide price/stat context."
 
         # 3) Full TradingView chart, most complete but heaviest.
-        full_budget = (48 if (mode in {"current", "fast"} and view in {"session", "full_day", "day"}) else (34 if mode in {"current", "fast"} else (64 if mode == "safe_current" else hard_timeout)))
+        # v5.7: keep nearly all current-mode budget for the full-chart path, but make
+        # its internal steps shorter. This lets range_attempt return its stage notes instead
+        # of the wrapper killing it at 48s before debug can surface.
+        full_budget = (56 if (mode in {"current", "fast"} and view in {"session", "full_day", "day"}) else (34 if mode in {"current", "fast"} else (70 if mode == "safe_current" else hard_timeout)))
         out_path, shot_path, status, note = await _try_with_budget(
             _screenshot_single_url(url, symbol, interval, mode, "full", view, target_date),
             full_budget,
@@ -1422,7 +1469,7 @@ async def chart(
         yahoo_interval_used=YF_INTERVALS.get(interval, "5m"),
         range_hint=range_hint,
         target_date=target_date,
-        source_chart="TradingView visual chart screenshot via Browserless remote browser; uses native custom range as a core target (current 09:45→now+1m capped 18:10, historical 09:45→18:10) and image-detected last-candle hover above the final candle column",
+        source_chart="TradingView visual chart screenshot via Browserless remote browser; graph-only range-first/no-prewait capture. Uses native custom range as core target (current 09:55→now+1m capped 18:10, historical 09:55→18:10) and image-detected last-candle hover above the final candle column",
         source_data="Graph-only strict TradingView image capture. No Midas/Bloomberg/Yahoo/Stooq/BIST market-data calls are made by this endpoint.",
         tradingview_url=tv_url,
         screenshot_url=screenshot_url,
