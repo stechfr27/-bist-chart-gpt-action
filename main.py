@@ -25,7 +25,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "5.7.0-graph-only-selftested-range-first"
+APP_VERSION = "5.8.0-range-first-light-debug"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -958,7 +958,7 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
         # useful if the bottom range control exists.
         nav_timeout = 45000 if mode == "safe_current" else (28000 if mode in {"current", "fast"} else 55000)
         if source_kind == "full" and mode in {"current", "fast"} and view in {"session", "full_day", "day"}:
-            nav_timeout = int(os.getenv("TV_RANGE_FIRST_GOTO_TIMEOUT_MS", "12000"))
+            nav_timeout = int(os.getenv("TV_RANGE_FIRST_GOTO_TIMEOUT_MS", "8000"))
         page.set_default_navigation_timeout(nav_timeout)
         goto_note = ""
         try:
@@ -969,15 +969,32 @@ async def _screenshot_single_url(url: str, symbol: str, interval: str, mode: str
             goto_note = f"goto soft-failed {type(goto_error).__name__}: {str(goto_error)[:160]}"
         setattr(page, "_bist_goto_note", goto_note)
         await click_soft_popups(page)
-        await apply_session_view_controls(page, view, target_date)
+        # v5.8: for graph-only session requests, do not spend the Browserless free-session
+        # budget on pre-fitting/zooming before the custom range target is attempted.
+        # Go straight to the special range UI, log stages, then validate/screenshot once.
+        if source_kind == "full" and mode in {"current", "fast"} and view in {"session", "full_day", "day"}:
+            try:
+                custom_note = await asyncio.wait_for(
+                    try_tradingview_custom_date_range(page, target_date, view),
+                    timeout=TV_CUSTOM_RANGE_MAX_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                custom_note = f"range_attempt enabled=true stage=custom_range_timeboxed max_seconds={TV_CUSTOM_RANGE_MAX_SECONDS}"
+            except Exception as e:
+                custom_note = f"range_attempt enabled=true stage=custom_range_failed error={type(e).__name__}: {e}"
+            setattr(page, "_bist_custom_range_note", custom_note)
+        else:
+            await apply_session_view_controls(page, view, target_date)
         await try_tradingview_fullscreen(page)
         await hover_latest_candle_column(page)
         base_wait = (2200 if mode == "safe_current" else TV_WAIT_CURRENT_MS) if mode in {"current", "fast", "safe_current"} else TV_WAIT_BALANCED_MS
         canvas_wait = (1500 if mode == "safe_current" else TV_CANVAS_WAIT_CURRENT_MS) if mode in {"current", "fast", "safe_current"} else TV_CANVAS_WAIT_BALANCED_MS
-        max_attempts = 5 if mode == "safe_current" else (2 if mode in {"current", "fast"} else 5)
+        if source_kind == "full" and mode in {"current", "fast"} and view in {"session", "full_day", "day"}:
+            canvas_wait = min(canvas_wait, 500)
+        max_attempts = 1 if (source_kind == "full" and mode in {"current", "fast"} and view in {"session", "full_day", "day"}) else (5 if mode == "safe_current" else (2 if mode in {"current", "fast"} else 5))
         last_validation_note = ""
         for attempt in range(1, max_attempts + 1):
-            await page.wait_for_timeout(base_wait if attempt == 1 else (2200 if mode == "safe_current" else (1400 if mode in {"current", "fast"} else 3500)))
+            await page.wait_for_timeout(650 if (source_kind == "full" and mode in {"current", "fast"} and view in {"session", "full_day", "day"}) else (base_wait if attempt == 1 else (2200 if mode == "safe_current" else (1400 if mode in {"current", "fast"} else 3500))))
             canvas_found = False
             for selector in ["canvas", "div.chart-container", "div.tv-lightweight-charts", "div[data-name='legend-source-item']", "div[data-name='legend']"]:
                 try:
@@ -1134,7 +1151,7 @@ async def screenshot_tradingview(url: str, symbol: str, interval: str, mode: str
         # v5.7: keep nearly all current-mode budget for the full-chart path, but make
         # its internal steps shorter. This lets range_attempt return its stage notes instead
         # of the wrapper killing it at 48s before debug can surface.
-        full_budget = (56 if (mode in {"current", "fast"} and view in {"session", "full_day", "day"}) else (34 if mode in {"current", "fast"} else (70 if mode == "safe_current" else hard_timeout)))
+        full_budget = (42 if (mode in {"current", "fast"} and view in {"session", "full_day", "day"}) else (34 if mode in {"current", "fast"} else (70 if mode == "safe_current" else hard_timeout)))
         out_path, shot_path, status, note = await _try_with_budget(
             _screenshot_single_url(url, symbol, interval, mode, "full", view, target_date),
             full_budget,
