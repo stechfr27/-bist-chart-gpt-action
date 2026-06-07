@@ -1,7 +1,5 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-playwright==1.49.1
-pydantic==2.10.4
-pillow==11.0.0
-python-multipart==0.0.20
-tzdata==2025.2
+fastapi==0.110.1
+uvicorn==0.29.0
+playwright==1.44.0
+pytz==2024.1
+python-multipart==0.0.9

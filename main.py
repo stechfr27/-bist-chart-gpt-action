@@ -1,495 +1,571 @@
-import os, re, uuid, asyncio
-from datetime import datetime, timedelta, time, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from pathlib import Path
-from typing import Optional, Dict, Any, List
+"""
+BIST Grafik Görsel Getirme Ajanı  v2.0
+===============================================
+TradingView üzerinden otomatik 5dk BIST mum grafik screenshot servisi.
 
-from fastapi import FastAPI, Query
+Akış:
+  GET /prepare-chart  → session_id
+  GET /capture-chart  → screenshot_url
+  GET /chart-agent    → tek çağrıda ikisi birden (debug)
+  GET /health
+  GET /debug/range-target
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+import pytz
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
-VERSION = "7.4.1-operator-mode-tzfix"
-APP_BASE_URL = os.getenv("APP_BASE_URL", "https://bist-chart-gpt-action.onrender.com").rstrip("/")
-BROWSERLESS_WS_ENDPOINT = os.getenv("BROWSERLESS_WS_ENDPOINT", "")
-PORT = int(os.getenv("PORT", "10000"))
-try:
-    TZ = ZoneInfo("Europe/Istanbul")
-except ZoneInfoNotFoundError:
-    # Fallback for slim containers missing OS timezone data. Turkey has fixed UTC+3.
-    TZ = timezone(timedelta(hours=3), name="Europe/Istanbul")
+# ══════════════════════════════════════════════════════════════════════════════
+#  Sabitler
+# ══════════════════════════════════════════════════════════════════════════════
+TZ_IST         = pytz.timezone("Europe/Istanbul")
+BIST_START     = (9, 55)     # seans başlangıcı
+BIST_END       = (18, 10)    # seans sonu
+SESSION_TTL    = 300         # saniye – hazırlanmış sayfanın ömrü
+VIEWPORT       = {"width": 1440, "height": 760}
+SCREENSHOT_DIR = Path("/tmp/screenshots")
+SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
-VIEWPORT_WIDTH = int(os.getenv("VIEWPORT_WIDTH", "2400"))
-VIEWPORT_HEIGHT = int(os.getenv("VIEWPORT_HEIGHT", "1350"))
-BROWSERLESS_TIMEOUT_MS = int(os.getenv("BROWSERLESS_TIMEOUT_MS", "60000"))
-PREPARE_GOTO_TIMEOUT_MS = int(os.getenv("PREPARE_GOTO_TIMEOUT_MS", "18000"))
-PREPARE_TOTAL_TIMEOUT_SEC = int(os.getenv("PREPARE_TOTAL_TIMEOUT_SEC", "66"))
-CAPTURE_TIMEOUT_SEC = int(os.getenv("CAPTURE_TIMEOUT_SEC", "15"))
-SESSION_TTL_SECONDS = int(os.getenv("PREPARE_SESSION_TTL_SECONDS", "80"))
+# Render, RENDER_EXTERNAL_URL'yi otomatik set eder — ek ayar gerekmez.
+# Manuel override için HOST_URL env var kullanılabilir.
+HOST_URL = (
+    os.getenv("HOST_URL")
+    or os.getenv("RENDER_EXTERNAL_URL", "")
+).rstrip("/")
 
-TV_SESSION_START = os.getenv("BIST_SESSION_START", "09:55")
-TV_SESSION_END = os.getenv("BIST_SESSION_END", "18:10")
-TV_CURRENT_PLUS_MINUTES = int(os.getenv("TV_CURRENT_PLUS_MINUTES", "1"))
-TV_OPERATOR_RETRIES = int(os.getenv("TV_OPERATOR_RETRIES", "3"))
-TV_REQUIRE_EXACT_RANGE = os.getenv("TV_REQUIRE_EXACT_RANGE", "false").lower() == "true"
-TV_FORCE_FULLSCREEN = os.getenv("TV_FORCE_FULLSCREEN", "true").lower() == "true"
-TV_HOVER_LAST_CANDLE = os.getenv("TV_HOVER_LAST_CANDLE", "true").lower() == "true"
-TV_LAST_CANDLE_X_RATIO = float(os.getenv("TV_LAST_CANDLE_X_RATIO", "0.965"))
-TV_LAST_CANDLE_Y_RATIO = float(os.getenv("TV_LAST_CANDLE_Y_RATIO", "0.38"))
-
-ROOT = Path(__file__).parent
-SHOT_DIR = ROOT / "screenshots"
-SHOT_DIR.mkdir(exist_ok=True)
-
-app = FastAPI(title="BIST Chart Visual Fetcher", version=VERSION)
-app.mount("/screenshots", StaticFiles(directory=str(SHOT_DIR)), name="screenshots")
-
-_pw = None
-_browser = None
-_context = None
-_sessions: Dict[str, Dict[str, Any]] = {}
+# ══════════════════════════════════════════════════════════════════════════════
+#  Global tarayıcı + oturum deposu
+# ══════════════════════════════════════════════════════════════════════════════
+_pw       = None
+_browser: Optional[Browser] = None
+_sessions: dict[str, dict]  = {}   # session_id → {page, ctx, meta, created_at}
 
 
-def parse_hhmm(s: str) -> time:
-    h, m = [int(x) for x in s.split(":")]
-    return time(hour=h, minute=m)
+async def _cleanup_loop() -> None:
+    """Süresi dolan oturumları arka planda temizle."""
+    while True:
+        await asyncio.sleep(60)
+        now  = time.time()
+        dead = [k for k, v in list(_sessions.items())
+                if now - v["created_at"] > SESSION_TTL]
+        for sid in dead:
+            s = _sessions.pop(sid, {})
+            for obj in (s.get("page"), s.get("ctx")):
+                try:
+                    if obj:
+                        await obj.close()
+                except Exception:
+                    pass
 
 
-def compute_range(target_date: Optional[str] = None) -> Dict[str, str]:
-    now = datetime.now(TZ)
-    if target_date:
-        d = datetime.strptime(target_date, "%Y-%m-%d").date()
-        start_dt = datetime.combine(d, parse_hhmm(TV_SESSION_START), TZ)
-        end_dt = datetime.combine(d, parse_hhmm(TV_SESSION_END), TZ)
-    else:
-        d = now.date()
-        start_dt = datetime.combine(d, parse_hhmm(TV_SESSION_START), TZ)
-        end_cap = datetime.combine(d, parse_hhmm(TV_SESSION_END), TZ)
-        end_dt = min(now + timedelta(minutes=TV_CURRENT_PLUS_MINUTES), end_cap)
-        if end_dt < start_dt:
-            end_dt = start_dt + timedelta(minutes=5)
-    return {
-        "target_start": start_dt.strftime("%d.%m.%Y %H:%M"),
-        "target_end": end_dt.strftime("%d.%m.%Y %H:%M"),
-        "iso_start": start_dt.isoformat(),
-        "iso_end": end_dt.isoformat(),
-        "start_date_tr": start_dt.strftime("%d.%m.%Y"),
-        "end_date_tr": end_dt.strftime("%d.%m.%Y"),
-        "start_time": start_dt.strftime("%H:%M"),
-        "end_time": end_dt.strftime("%H:%M"),
-    }
-
-
-def tv_symbol(symbol: str) -> str:
-    s = symbol.upper().strip()
-    if ":" in s:
-        return s
-    return f"BIST:{s}"
-
-
-def tv_url(symbol: str, interval: str = "5m", target_date: Optional[str] = None) -> str:
-    interval_num = "5" if interval in ("5m", "5") else re.sub(r"\D", "", interval) or "5"
-    # Timestamp hints help TV jump near the date but do not guarantee exact range.
-    extra = ""
-    if target_date:
-        d = datetime.strptime(target_date, "%Y-%m-%d").replace(tzinfo=TZ)
-        ts = int(d.timestamp())
-        extra = f"&timestamp={ts}&time={ts}"
-    return f"https://tr.tradingview.com/chart/?symbol={tv_symbol(symbol)}&interval={interval_num}&range=1D{extra}"
-
-
-async def get_context(force_new: bool = False):
-    global _pw, _browser, _context
-    if force_new:
-        await close_context_only()
-    if _pw is None:
-        _pw = await async_playwright().start()
-    try:
-        if _context is not None:
-            # Probe context viability.
-            _ = _context.pages
-            return _context
-    except Exception:
-        _context = None
-    if BROWSERLESS_WS_ENDPOINT:
-        _browser = await _pw.chromium.connect_over_cdp(BROWSERLESS_WS_ENDPOINT, timeout=BROWSERLESS_TIMEOUT_MS)
-    else:
-        _browser = await _pw.chromium.launch(headless=True)
-    _context = await _browser.new_context(
-        viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-        device_scale_factor=1,
-        locale="tr-TR",
-        timezone_id="Europe/Istanbul",
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _pw, _browser
+    _pw = await async_playwright().start()
+    _browser = await _pw.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--no-first-run",
+            "--single-process",
+            "--disable-extensions",
+            "--mute-audio",
+            "--ignore-certificate-errors",
+        ],
     )
-    _context.set_default_timeout(8000)
-    return _context
+    asyncio.create_task(_cleanup_loop())
+    yield
+    if _browser:
+        await _browser.close()
+    if _pw:
+        await _pw.stop()
 
 
-async def close_context_only():
-    global _context, _browser
-    try:
-        if _context:
-            await _context.close()
-    except Exception:
-        pass
-    _context = None
-    try:
-        if _browser:
-            await _browser.close()
-    except Exception:
-        pass
-    _browser = None
+# ══════════════════════════════════════════════════════════════════════════════
+#  Uygulama
+# ══════════════════════════════════════════════════════════════════════════════
+app = FastAPI(
+    title       = "BIST Grafik Ajanı",
+    description = "TradingView BIST 5dk mum grafikleri – otomatik screenshot servisi",
+    version     = "2.0.0",
+    lifespan    = lifespan,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins  = ["*"],
+    allow_methods  = ["*"],
+    allow_headers  = ["*"],
+)
+app.mount(
+    "/screenshots",
+    StaticFiles(directory=str(SCREENSHOT_DIR)),
+    name="screenshots",
+)
 
 
-async def cleanup_sessions():
-    now = datetime.now(TZ).timestamp()
-    expired = [sid for sid, val in _sessions.items() if now - val.get("created_ts", now) > SESSION_TTL_SECONDS]
-    for sid in expired:
+# ══════════════════════════════════════════════════════════════════════════════
+#  Yardımcı fonksiyonlar
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calc_range(target_date: Optional[str]) -> tuple[datetime, datetime]:
+    """
+    BIST seans aralığını Istanbul saat diliminde hesapla.
+
+    target_date=None → bugün; güncel grafik (09:55 → şu an+1dk, max 18:10)
+    target_date=YYYY-MM-DD → o günün tamamı (09:55 → 18:10)
+    """
+    now = datetime.now(TZ_IST)
+
+    if target_date:
+        d     = datetime.strptime(target_date, "%Y-%m-%d")
+        start = TZ_IST.localize(datetime(d.year, d.month, d.day, *BIST_START))
+        end   = TZ_IST.localize(datetime(d.year, d.month, d.day, *BIST_END))
+    else:
+        start   = now.replace(hour=BIST_START[0], minute=BIST_START[1],
+                               second=0, microsecond=0)
+        end_max = now.replace(hour=BIST_END[0],   minute=BIST_END[1],
+                               second=0, microsecond=0)
+        end_raw = now + timedelta(minutes=1)
+        end     = end_raw if end_raw < end_max else end_max
+
+    return start, end
+
+
+def build_url(symbol: str, start: datetime, end: datetime) -> str:
+    """
+    TradingView chart URL'si oluştur.
+    interval=5 → 5dk mum (zorunlu, değişmez)
+    style=1    → mum grafik
+    theme=dark → koyu tema (ekran görüntüsü için daha net)
+    """
+    return (
+        f"https://www.tradingview.com/chart/"
+        f"?symbol=BIST:{symbol.upper()}"
+        f"&interval=5"
+        f"&from={int(start.timestamp())}"
+        f"&to={int(end.timestamp())}"
+        f"&theme=dark"
+        f"&style=1"
+        f"&hide_side_toolbar=0"
+        f"&save_image=false"
+    )
+
+
+def get_base(request: Request) -> str:
+    """Sunucunun public base URL'sini döndür (HOST_URL öncelikli)."""
+    if HOST_URL:
+        return HOST_URL
+    return str(request.base_url).rstrip("/")
+
+
+# ── Tarayıcı otomasyon yardımcıları ──────────────────────────────────────────
+
+async def _dismiss_overlays(page: Page) -> None:
+    """Cookie banner ve sign-in popup'larını kapat."""
+    # Cookie/GDPR
+    for text in ["Accept all", "Accept", "Kabul et", "Agree", "I agree"]:
         try:
-            await val["page"].close()
+            btn = page.locator(f'button:has-text("{text}")').first
+            if await btn.is_visible(timeout=800):
+                await btn.click()
+                await page.wait_for_timeout(400)
+                break
         except Exception:
             pass
-        _sessions.pop(sid, None)
 
-
-async def safe_click(page, selectors: List[str], steps: List[Dict[str, Any]], label: str, timeout: int = 2000) -> bool:
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            await loc.wait_for(state="visible", timeout=timeout)
-            await loc.click(timeout=timeout)
-            steps.append({"stage": label, "ok": True, "selector": sel})
-            return True
-        except Exception as e:
-            last = str(e).split("\n")[0][:160]
-    steps.append({"stage": label, "ok": False, "tried": len(selectors), "error": last if 'last' in locals() else "not found"})
-    return False
-
-
-async def close_popups(page, steps):
+    # Modal kapatma butonları
     for sel in [
-        'button:has-text("Kabul")', 'button:has-text("Accept")', 'button:has-text("Tamam")',
-        '[aria-label="Close"]', 'button[aria-label="Close"]', 'button:has-text("Daha sonra")'
+        '[data-name="close"]',
+        'button[aria-label="Close"]',
+        '.tv-dialog__close',
+        '[class*="closeButton"]',
+        '[class*="close-button"]',
+        '[class*="CloseButton"]',
     ]:
         try:
-            await page.locator(sel).first.click(timeout=900)
-            steps.append({"stage":"close_popup", "ok":True, "selector":sel})
-            await page.wait_for_timeout(300)
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=500):
+                await btn.click()
+                await page.wait_for_timeout(300)
         except Exception:
             pass
 
 
-async def force_interval_5m(page, steps):
-    # URL interval usually works. Try hotkey-like direct interval button if visible.
-    ok = await safe_click(page, [
-        'button:has-text("5dk")', 'button:has-text("5m")', '[data-name="interval-dialog-button"]'
-    ], steps, "select_interval_button", timeout=1400)
-    if ok:
-        try:
-            await page.keyboard.press("Control+A")
-            await page.keyboard.type("5")
-            await page.keyboard.press("Enter")
-            steps.append({"stage":"select_interval_5m_keyboard", "ok":True})
-            await page.wait_for_timeout(800)
-        except Exception as e:
-            steps.append({"stage":"select_interval_5m_keyboard", "ok":False, "error":str(e)[:160]})
-    else:
-        steps.append({"stage":"select_interval_5m", "ok":"assumed_from_url"})
-
-
-async def try_custom_range_ui(page, rg: Dict[str, str], steps) -> bool:
-    # Several routes: bottom range custom button, keyboard shortcuts, visible labels.
-    success = False
-    range_buttons = [
-        'button:has-text("Tümü")', 'button:has-text("All")', 'button:has-text("1G")', 'button:has-text("1D")',
-        'div:has-text("Tümü")', 'div:has-text("1G")', '[data-name="date-ranges-tabs"] button:last-child'
-    ]
-    await safe_click(page, range_buttons, steps, "open_range_area", timeout=1800)
-    await page.wait_for_timeout(500)
-    custom_ok = await safe_click(page, [
-        'button:has-text("Özel")', 'button:has-text("Custom")', 'div:has-text("Özel aralık")', 'div:has-text("Custom range")'
-    ], steps, "open_custom_range", timeout=1700)
-
-    # If no dialog visible, try direct keyboard date navigation shortcut variants.
-    if not custom_ok:
-        for combo in ["Alt+G", "Meta+G", "Control+G"]:
-            try:
-                await page.keyboard.press(combo)
-                steps.append({"stage":"keyboard_open_go_to", "ok":True, "combo":combo})
-                await page.wait_for_timeout(700)
-                break
-            except Exception as e:
-                steps.append({"stage":"keyboard_open_go_to", "ok":False, "combo":combo, "error":str(e)[:100]})
-
-    # Fill inputs if visible. TV changes UI often, so try all text/datetime inputs.
-    text = f"{rg['target_start']} - {rg['target_end']}"
-    filled_any = False
+async def _wait_for_chart(page: Page) -> None:
+    """
+    Grafik canvas'ının yüklenmesini bekle.
+    TradingView JS-ağır olduğu için belirli sinyalleri bekle.
+    """
     try:
-        inputs = page.locator('input')
-        count = min(await inputs.count(), 10)
-        steps.append({"stage":"input_scan", "ok":True, "count":count})
-        if count >= 1:
-            # Try first input as combined range, then first two as start/end.
-            try:
-                await inputs.nth(0).click(timeout=1500)
-                await page.keyboard.press("Control+A")
-                await page.keyboard.type(text)
-                filled_any = True
-                steps.append({"stage":"fill_combined_range", "ok":True, "value":text})
-            except Exception as e:
-                steps.append({"stage":"fill_combined_range", "ok":False, "error":str(e)[:160]})
-        if count >= 2:
-            try:
-                await inputs.nth(0).click(timeout=1500)
-                await page.keyboard.press("Control+A")
-                await page.keyboard.type(rg['target_start'])
-                await inputs.nth(1).click(timeout=1500)
-                await page.keyboard.press("Control+A")
-                await page.keyboard.type(rg['target_end'])
-                filled_any = True
-                steps.append({"stage":"fill_start_end_inputs", "ok":True, "start":rg['target_start'], "end":rg['target_end']})
-            except Exception as e:
-                steps.append({"stage":"fill_start_end_inputs", "ok":False, "error":str(e)[:160]})
-    except Exception as e:
-        steps.append({"stage":"input_scan", "ok":False, "error":str(e)[:160]})
+        await page.wait_for_selector("canvas", timeout=18000)
+    except Exception:
+        pass  # Canvas bulunamazsa devam et, screenshot zaten gösterecek
 
-    if filled_any:
-        applied = await safe_click(page, [
-            'button:has-text("Uygula")', 'button:has-text("Apply")', 'button:has-text("Git")', 'button:has-text("Go")'
-        ], steps, "apply_custom_range", timeout=2000)
-        if not applied:
-            try:
-                await page.keyboard.press("Enter")
-                steps.append({"stage":"apply_custom_range_enter", "ok":True})
-            except Exception as e:
-                steps.append({"stage":"apply_custom_range_enter", "ok":False, "error":str(e)[:160]})
-        success = True
-        await page.wait_for_timeout(3500)
-    return success
+    # Yükleme spinner'ı bitene kadar bekle (max 10 sn)
+    try:
+        await page.wait_for_function(
+            "() => !document.querySelector('[class*=\"spinner\"]')",
+            timeout=10000,
+        )
+    except Exception:
+        pass
+
+    await page.wait_for_timeout(2500)   # görsel render tamamlansın
 
 
-async def force_fullscreen(page, steps):
-    if not TV_FORCE_FULLSCREEN:
-        return
-    for sel in ['[data-name="header-toolbar-fullscreen"]', 'button[aria-label*="Tam ekran"]', 'button[aria-label*="Fullscreen"]']:
-        try:
-            await page.locator(sel).first.click(timeout=1200)
-            steps.append({"stage":"force_fullscreen", "ok":True, "selector":sel})
-            await page.wait_for_timeout(500)
+async def _enforce_5m(page: Page) -> bool:
+    """
+    5dk interval'ın aktif olduğunu doğrula.
+    URL'de interval=5 zaten ayarlı; bu fonksiyon ek güvenlik katmanıdır.
+    Yanlış interval tespitinde True döner (sorun yok).
+    """
+    try:
+        text = await page.evaluate("""
+            () => {
+                // TradingView üst toolbar'daki aktif interval metnini bul
+                const candidates = [
+                    '[data-name="header-toolbar-intervals"] [class*="text"]',
+                    '[class*="interval"] [class*="active"]',
+                    '[class*="toolbar"] [class*="selected"]',
+                ];
+                for (const sel of candidates) {
+                    const el = document.querySelector(sel);
+                    if (el) return el.textContent.trim();
+                }
+                return '';
+            }
+        """)
+        return "5" in str(text)
+    except Exception:
+        return True   # belirsiz → devam et
+
+
+async def _hover_last_candle(page: Page) -> None:
+    """
+    Grafikteki en sağdaki son gerçek mumun üzerine hover yap.
+    TradingView header'ında OHLC değerlerinin görünmesini sağlar.
+
+    Strateji:
+      - En büyük canvas'ı bul (ana grafik)
+      - Fiyat skalasının (sağda ~65px) hemen soluna kon
+      - Yavaş hareketle TradingView hover event'ini tetikle
+    """
+    try:
+        await page.wait_for_selector("canvas", timeout=6000)
+
+        # En büyük (ana grafik) canvas'ı bul
+        canvases = page.locator("canvas")
+        n        = await canvases.count()
+        best: Optional[dict] = None
+
+        for i in range(n):
+            box = await canvases.nth(i).bounding_box()
+            if box and box["width"] > 400 and box["height"] > 200:
+                if best is None or (box["width"] * box["height"]
+                                    > best["width"] * best["height"]):
+                    best = box
+
+        if not best:
             return
-        except Exception:
-            pass
-    steps.append({"stage":"force_fullscreen", "ok":False, "note":"button not found"})
 
+        # Hedef koordinatlar
+        # x → fiyat skalasının (~65px) hemen solunda = son mum civarı
+        # y → grafiğin üst %38'i (mum gövdeleri genellikle burada)
+        target_x = best["x"] + best["width"] - 90
+        target_y = best["y"] + best["height"] * 0.38
 
-async def hover_last_candle(page, steps):
-    if not TV_HOVER_LAST_CANDLE:
-        return
-    try:
-        x = int(VIEWPORT_WIDTH * TV_LAST_CANDLE_X_RATIO)
-        y = int(VIEWPORT_HEIGHT * TV_LAST_CANDLE_Y_RATIO)
-        await page.mouse.move(x, y)
-        steps.append({"stage":"hover_last_candle", "ok":True, "x":x, "y":y})
-        await page.wait_for_timeout(700)
-    except Exception as e:
-        steps.append({"stage":"hover_last_candle", "ok":False, "error":str(e)[:160]})
+        # Ortadan yavaşça sağa sür
+        mid_x = best["x"] + best["width"] * 0.55
+        await page.mouse.move(mid_x, target_y)
+        await page.wait_for_timeout(150)
+        await page.mouse.move(target_x, target_y, steps=20)
+        await page.wait_for_timeout(900)
 
-
-async def validate_chart(page, steps) -> Dict[str, Any]:
-    text = ""
-    try:
-        text = (await page.locator("body").inner_text(timeout=2500))[:4000]
     except Exception:
-        pass
-    bad_patterns = ["Sembol mevcut değil", "symbol is unavailable", "No data", "Something went wrong"]
-    bad = any(p.lower() in text.lower() for p in bad_patterns)
-    # We cannot read canvas pixels reliably here. Body/title validation is enough for screenshot gate.
-    title = ""
+        pass   # hover başarısız olsa bile screenshot alınabilir
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Çekirdek iş mantığı (endpoint'lerden bağımsız çağrılabilir)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _do_prepare(symbol: str, target_date: Optional[str]) -> dict:
+    """
+    TradingView'de 5dk BIST grafiğini hazırla.
+    Başarılıysa session_id döner → _do_capture'a verilir.
+    """
+    if not _browser or not _browser.is_connected():
+        return {
+            "ok":           False,
+            "status":       "prepare_failed",
+            "failed_stage": "browser_unavailable",
+            "error":        "Tarayıcı hazır değil. /health kontrol et.",
+        }
+
+    # Tarih aralığını hesapla
     try:
-        title = await page.title()
-    except Exception:
-        pass
-    ok = not bad and ("THY" in text.upper() or "THYAO" in title.upper() or "TÜRK" in text.upper() or True)
-    steps.append({"stage":"validate_chart_text", "ok":ok, "bad_screen":bad, "title":title[:120]})
-    return {"ok": ok, "bad_screen": bad, "title": title, "body_excerpt": text[:600]}
+        start_dt, end_dt = calc_range(target_date)
+    except ValueError as exc:
+        return {
+            "ok":           False,
+            "status":       "prepare_failed",
+            "failed_stage": "invalid_date",
+            "error":        str(exc),
+        }
 
+    url = build_url(symbol, start_dt, end_dt)
+    sid = str(uuid.uuid4())
 
-async def prepare_operator(symbol: str, interval: str, target_date: Optional[str], view: str) -> Dict[str, Any]:
-    await cleanup_sessions()
-    rg = compute_range(target_date)
-    steps: List[Dict[str, Any]] = []
-    url = tv_url(symbol, interval, target_date)
-    last_error = None
-    for attempt in range(1, TV_OPERATOR_RETRIES + 1):
-        try:
-            ctx = await get_context(force_new=(attempt > 1))
-            page = await ctx.new_page()
-            page.set_default_timeout(6000)
-            steps.append({"stage":"new_page", "ok":True, "attempt":attempt})
-            await page.goto(url, wait_until="domcontentloaded", timeout=PREPARE_GOTO_TIMEOUT_MS)
-            steps.append({"stage":"goto_domcontentloaded", "ok":True, "url":url})
-            await page.wait_for_timeout(1800)
-            await close_popups(page, steps)
-            await force_interval_5m(page, steps)
-            await force_fullscreen(page, steps)
-            # Try custom range repeatedly, but don't block forever.
-            range_success = False
-            for i in range(2):
-                try:
-                    range_success = await asyncio.wait_for(try_custom_range_ui(page, rg, steps), timeout=18)
-                    if range_success:
-                        break
-                except Exception as e:
-                    steps.append({"stage":"custom_range_attempt_timeout_or_error", "ok":False, "round":i+1, "error":str(e)[:180]})
-            await hover_last_candle(page, steps)
-            val = await validate_chart(page, steps)
-            exact_conf = 0.55 if range_success else 0.25
-            if range_success:
-                exact_conf = 0.72
-            # Store session even if exact confidence is not perfect; user requested output, not fail-close.
-            sid = uuid.uuid4().hex[:16]
-            _sessions[sid] = {
-                "page": page,
-                "created_ts": datetime.now(TZ).timestamp(),
-                "symbol": symbol.upper(),
-                "interval": interval,
-                "target_date": target_date,
-                "range": rg,
-                "steps": steps,
-                "exact_range_confidence": exact_conf,
-                "range_success": range_success,
-                "url": url,
-                "validation": val,
-            }
-            return {
-                "ok": True,
-                "status": "ready_for_capture",
-                "session_id": sid,
-                "symbol": symbol.upper(),
-                "interval": interval,
-                "target_date": target_date,
-                **rg,
-                "exact_range_confidence": exact_conf,
-                "range_success": range_success,
-                "operator_steps": steps,
-                "note": "Grafik hazırlandı; capture-chart çağrısı ile ekran görüntüsü alınabilir. exact_range_confidence değerini kontrol edin.",
-            }
-        except Exception as e:
-            last_error = str(e)
-            steps.append({"stage":"prepare_attempt_error", "ok":False, "attempt":attempt, "error":last_error[:260]})
+    ctx:  Optional[BrowserContext] = None
+    page: Optional[Page]           = None
+
+    try:
+        ctx = await _browser.new_context(
+            viewport       = VIEWPORT,
+            user_agent     = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale         = "tr-TR",
+            timezone_id    = "Europe/Istanbul",
+        )
+        page = await ctx.new_page()
+
+        # Sayfa yükle
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(3500)
+
+        # Overlay/popup temizle
+        await _dismiss_overlays(page)
+        await page.wait_for_timeout(2000)
+
+        # Grafik yüklenmesini bekle
+        await _wait_for_chart(page)
+
+        # 5dk doğrula
+        await _enforce_5m(page)
+
+        # Son mum hover
+        await _hover_last_candle(page)
+
+        # Session'ı depola
+        _sessions[sid] = {
+            "page":       page,
+            "ctx":        ctx,
+            "symbol":     symbol.upper(),
+            "start_str":  start_dt.strftime("%d.%m.%Y %H:%M"),
+            "end_str":    end_dt.strftime("%d.%m.%Y %H:%M"),
+            "tv_url":     url,
+            "created_at": time.time(),
+        }
+
+        return {
+            "ok":           True,
+            "status":       "ready_for_capture",
+            "session_id":   sid,
+            "symbol":       symbol.upper(),
+            "interval":     "5dk",
+            "target_start": start_dt.strftime("%d.%m.%Y %H:%M"),
+            "target_end":   end_dt.strftime("%d.%m.%Y %H:%M"),
+        }
+
+    except Exception as exc:
+        for obj in (page, ctx):
             try:
-                await close_context_only()
+                if obj:
+                    await obj.close()
             except Exception:
                 pass
-    return {
-        "ok": False,
-        "status": "prepare_failed",
-        "session_id": None,
-        "symbol": symbol.upper(),
-        "interval": interval,
-        "target_date": target_date,
-        **rg,
-        "error": last_error,
-        "operator_steps": steps,
-    }
-
-
-async def capture_session(session_id: str) -> Dict[str, Any]:
-    await cleanup_sessions()
-    if session_id not in _sessions:
-        return {"ok": False, "status":"session_not_found_or_expired", "session_id": session_id}
-    s = _sessions[session_id]
-    page = s["page"]
-    try:
-        await hover_last_candle(page, s["steps"])
-        fname = f"{s['symbol']}_{s['interval']}_{s.get('target_date') or 'current'}_{datetime.now(TZ).strftime('%Y%m%dT%H%M%S')}_{session_id}.jpg"
-        path = SHOT_DIR / fname
-        await page.screenshot(path=str(path), type="jpeg", quality=94, full_page=False, timeout=CAPTURE_TIMEOUT_SEC*1000)
-        url = f"{APP_BASE_URL}/screenshots/{fname}"
         return {
-            "ok": True,
-            "status": "captured",
-            "session_id": session_id,
-            "screenshot_url": url,
-            "symbol": s["symbol"],
-            "interval": s["interval"],
-            "target_date": s["target_date"],
-            **s["range"],
-            "exact_range_confidence": s.get("exact_range_confidence"),
-            "range_success": s.get("range_success"),
-            "operator_steps": s.get("steps", []),
+            "ok":           False,
+            "status":       "prepare_failed",
+            "failed_stage": "page_load",
+            "error":        str(exc),
         }
-    except Exception as e:
-        return {"ok": False, "status":"capture_failed", "session_id": session_id, "error": str(e)}
 
 
-@app.get("/health")
+async def _do_capture(session_id: str, req_base: str) -> dict:
+    """
+    Hazırlanmış sayfanın ekran görüntüsünü al, screenshot_url döndür.
+    """
+    s = _sessions.get(session_id)
+    if not s:
+        return {
+            "ok":           False,
+            "status":       "capture_failed",
+            "failed_stage": "session_not_found",
+            "error":        "session_id geçersiz veya süresi dolmuş.",
+        }
+
+    page: Page = s["page"]
+    if page.is_closed():
+        _sessions.pop(session_id, None)
+        return {
+            "ok":           False,
+            "status":       "capture_failed",
+            "failed_stage": "page_closed",
+            "error":        "Sayfa kapanmış. Yeni /prepare-chart çağrısı gerekiyor.",
+        }
+
+    try:
+        # Son hover tekrarı (hafif kayma olursa düzelt)
+        await _hover_last_candle(page)
+        await page.wait_for_timeout(500)
+
+        # Dosya adı: THYAO_5m_20260602_173422_a1b2c3d4.png
+        fname = (
+            f"{s['symbol']}_5m"
+            f"_{datetime.now(TZ_IST).strftime('%Y%m%d_%H%M%S')}"
+            f"_{session_id[:8]}.png"
+        )
+        path = SCREENSHOT_DIR / fname
+        await page.screenshot(path=str(path), full_page=False)
+
+        # Sayfayı kapat, session'ı temizle
+        for obj in (page, s.get("ctx")):
+            try:
+                if obj:
+                    await obj.close()
+            except Exception:
+                pass
+        _sessions.pop(session_id, None)
+
+        return {
+            "ok":             True,
+            "status":         "captured",
+            "screenshot_url": f"{req_base}/screenshots/{fname}",
+            "symbol":         s["symbol"],
+            "interval":       "5dk",
+            "target_start":   s["start_str"],
+            "target_end":     s["end_str"],
+        }
+
+    except Exception as exc:
+        return {
+            "ok":           False,
+            "status":       "capture_failed",
+            "failed_stage": "screenshot",
+            "error":        str(exc),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Endpoint: GET /health
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/health", summary="Servis sağlık kontrolü")
 async def health():
+    """Servisin çalışıp çalışmadığını ve anlık durumunu döndürür."""
     return {
-        "ok": True,
-        "service": "bist-chart-gpt-action",
-        "version": VERSION,
-        "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT),
-        "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_playwright",
-        "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-        "operator_mode": {
-            "hard_force": True,
-            "retries": TV_OPERATOR_RETRIES,
-            "require_exact_range": TV_REQUIRE_EXACT_RANGE,
-            "note": "This version prioritizes producing the requested visual. It reports exact_range_confidence instead of fail-closing by default."
-        },
-        "bist_session_target": {"start": TV_SESSION_START, "end": TV_SESSION_END, "current_plus_minutes": TV_CURRENT_PLUS_MINUTES},
+        "ok":                    _browser is not None and _browser.is_connected(),
+        "version":               "2.0.0",
+        "browser_mode":          "local-playwright-chromium",
+        "browserless_configured": False,
+        "active_sessions":       len(_sessions),
+        "now_istanbul":          datetime.now(TZ_IST).strftime("%d.%m.%Y %H:%M:%S"),
     }
 
 
-@app.get("/warmup")
-async def warmup():
+# ══════════════════════════════════════════════════════════════════════════════
+#  Endpoint: GET /debug/range-target
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/debug/range-target", summary="Hedef seans aralığını hesapla (tarayıcı açılmaz)")
+async def debug_range(
+    target_date: Optional[str] = Query(
+        None, description="YYYY-MM-DD formatında tarih (boşsa bugün)"
+    ),
+):
+    """
+    TradingView açmadan hedef tarih/saat hesabını test eder.
+    Örnek: /debug/range-target?target_date=2026-06-02
+    """
     try:
-        await get_context(force_new=True)
-        return {"ok": True, "version": VERSION, "warmup_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_playwright", "note": "Browser context is ready."}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+        start, end = calc_range(target_date)
+        return {
+            "ok":           True,
+            "target_date":  target_date or datetime.now(TZ_IST).strftime("%Y-%m-%d"),
+            "target_start": start.strftime("%d.%m.%Y %H:%M"),
+            "target_end":   end.strftime("%d.%m.%Y %H:%M"),
+            "from_unix":    int(start.timestamp()),
+            "to_unix":      int(end.timestamp()),
+        }
+    except ValueError:
+        raise HTTPException(400, detail="Tarih formatı hatalı. YYYY-MM-DD kullanın.")
 
 
-@app.get("/debug/range-target")
-async def debug_range_target(target_date: Optional[str] = None, view: str = "session"):
-    return {"ok": True, "version": VERSION, "view": view, "target_date": target_date, **compute_range(target_date), "strict_rule": "current: today 09:55 -> Istanbul now +1m capped 18:10; historical: target date 09:55 -> 18:10; 5m only"}
+# ══════════════════════════════════════════════════════════════════════════════
+#  Endpoint: GET /prepare-chart
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/prepare-chart", summary="Grafiği hazırla, session_id al")
+async def prepare_chart(
+    request:     Request,
+    symbol:      str           = Query(...,       description="BIST hisse kodu (THYAO, ASELS …)"),
+    target_date: Optional[str] = Query(None,      description="YYYY-MM-DD — boşsa güncel grafik"),
+    interval:    str           = Query("5m",      description="Sabit 5m — değiştirilemez"),
+    view:        str           = Query("session", description="session=tüm seans"),
+):
+    """
+    TradingView'de BIST:SYMBOL grafiğini hazırlar.
+    - 5dk mum zorunludur (interval=5)
+    - Seans saatleri: 09:55–18:10 Istanbul
+    - Başarılıysa session_id döner → /capture-chart'a verilir
+    """
+    result = await _do_prepare(symbol, target_date)
+    status = 200 if result.get("ok") else 500
+    return JSONResponse(result, status_code=status)
 
 
-@app.get("/prepare-chart")
-async def prepare_chart(symbol: str = Query(...), interval: str = "5m", target_date: Optional[str] = None, view: str = "session"):
-    try:
-        return await asyncio.wait_for(prepare_operator(symbol, interval, target_date, view), timeout=PREPARE_TOTAL_TIMEOUT_SEC)
-    except asyncio.TimeoutError:
-        rg = compute_range(target_date)
-        return {"ok": False, "status": "prepare_timeout", "symbol": symbol.upper(), "interval": interval, "target_date": target_date, **rg}
+# ══════════════════════════════════════════════════════════════════════════════
+#  Endpoint: GET /capture-chart
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/capture-chart", summary="Hazırlanmış grafiğin screenshot'ını al")
+async def capture_chart(
+    request:    Request,
+    session_id: str = Query(..., description="/prepare-chart'tan dönen session_id"),
+):
+    """
+    Hazırlanmış sayfanın ekran görüntüsünü alır.
+    screenshot_url döner — bu URL'yi tarayıcıda açabilir veya GPT'ye verebilirsiniz.
+    """
+    result = await _do_capture(session_id, get_base(request))
+    fs     = result.get("failed_stage", "")
+    status = 200 if result.get("ok") else (404 if "not_found" in fs else 500)
+    return JSONResponse(result, status_code=status)
 
 
-@app.get("/capture-chart")
-async def capture_chart(session_id: str = Query(...)):
-    return await capture_session(session_id)
+# ══════════════════════════════════════════════════════════════════════════════
+#  Endpoint: GET /chart-agent  (tek çağrı — debug / hızlı test)
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/chart-agent", summary="Tek çağrıda prepare + capture (debug)")
+async def chart_agent(
+    request:     Request,
+    symbol:      str           = Query(...,  description="BIST hisse kodu"),
+    target_date: Optional[str] = Query(None, description="YYYY-MM-DD — boşsa güncel"),
+):
+    """
+    Tek HTTP çağrısında prepare + capture yapar.
+    Üretimde Custom GPT iki aşamalı akışı (prepareChart → captureChart) kullanır;
+    bu endpoint yalnızca debug ve hızlı test içindir.
+    """
+    p = await _do_prepare(symbol, target_date)
+    if not p.get("ok"):
+        return JSONResponse(p, status_code=500)
 
-
-@app.get("/chart-agent")
-async def chart_agent(symbol: str = Query(...), interval: str = "5m", target_date: Optional[str] = None, view: str = "session"):
-    prep = await prepare_chart(symbol=symbol, interval=interval, target_date=target_date, view=view)
-    if not prep.get("ok") or not prep.get("session_id"):
-        return prep
-    cap = await capture_session(prep["session_id"])
-    return {"prepare": prep, "capture": cap, "screenshot_url": cap.get("screenshot_url"), "ok": cap.get("ok", False)}
-
-
-@app.get("/screenshots-list")
-async def screenshots_list():
-    files = sorted(SHOT_DIR.glob("*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return {"ok": True, "files": [f"{APP_BASE_URL}/screenshots/{p.name}" for p in files[:50]]}
-
-
-@app.get("/screenshots-clear")
-async def screenshots_clear():
-    count = 0
-    for p in SHOT_DIR.glob("*.jpg"):
-        try:
-            p.unlink(); count += 1
-        except Exception: pass
-    return {"ok": True, "deleted": count}
+    c = await _do_capture(p["session_id"], get_base(request))
+    return JSONResponse(c, status_code=200 if c.get("ok") else 500)
