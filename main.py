@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import asyncio
 from PIL import Image
-from typing import Optional
+from typing import Optional, Any
 
 try:
     import pandas as pd
@@ -25,7 +25,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "6.1.0-browserless-key-screen-capture"
+APP_VERSION = "7.0.0-prepare-capture-agent"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -178,6 +178,36 @@ class BrowserManager:
 
 BROWSER = BrowserManager()
 
+
+PREPARED_CHARTS: dict[str, dict[str, Any]] = {}
+PREPARE_SESSION_TTL_SECONDS = int(os.getenv("PREPARE_SESSION_TTL_SECONDS", "70"))
+TV_PREPARE_GOTO_TIMEOUT_MS = int(os.getenv("TV_PREPARE_GOTO_TIMEOUT_MS", "12000"))
+TV_PREPARE_POST_RANGE_WAIT_MS = int(os.getenv("TV_PREPARE_POST_RANGE_WAIT_MS", "1200"))
+
+async def cleanup_prepared_charts():
+    now = time.time()
+    expired = []
+    for sid, rec in list(PREPARED_CHARTS.items()):
+        if rec.get("expires_at", 0) < now:
+            expired.append(sid)
+    for sid in expired:
+        rec = PREPARED_CHARTS.pop(sid, None)
+        page = rec.get("page") if rec else None
+        try:
+            if page:
+                await page.close()
+        except Exception:
+            pass
+    return expired
+
+def _stage_list_from_note(note: str) -> list[str]:
+    stages = []
+    for part in (note or "").split("|"):
+        part = part.strip()
+        if part.startswith("stage=") or part.startswith("range_attempt") or part.startswith("target_") or part.startswith("goto"):
+            stages.append(part)
+    return stages
+
 class ChartResponse(BaseModel):
     symbol: str
     yahoo_symbol: str
@@ -214,11 +244,11 @@ async def shutdown_event():
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "endpoints": ["/health", "/warmup", "/chart", "/screenshots-list", "/screenshots-clear"]}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "endpoints": ["/health", "/warmup", "/prepare-chart", "/capture-chart", "/chart-agent", "/debug/range-target", "/chart", "/screenshots-list", "/screenshots-clear"]}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END, "strict_note": BIST_SESSION_STRICT_NOTE}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO, "image_detect_last_candle": TV_IMAGE_DETECT_LAST_CANDLE}, "custom_range": {"enabled": TV_USE_CUSTOM_RANGE, "core": TV_CUSTOM_RANGE_CORE, "max_seconds": TV_CUSTOM_RANGE_MAX_SECONDS, "env_aliases": {"CHART_TOTAL_TIMEOUT_SEC": os.getenv("CHART_TOTAL_TIMEOUT_SEC"), "TV_RANGE_MAX_SECONDS": os.getenv("TV_RANGE_MAX_SECONDS"), "TV_FULL_CHART_BUDGET_SECONDS": os.getenv("TV_FULL_CHART_BUDGET_SECONDS")}, "session_start": TV_CUSTOM_RANGE_START, "session_end": TV_CUSTOM_RANGE_END, "current_plus_minutes": TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES, "range_attempt_json": True}}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END, "strict_note": BIST_SESSION_STRICT_NOTE}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO, "image_detect_last_candle": TV_IMAGE_DETECT_LAST_CANDLE}, "custom_range": {"enabled": TV_USE_CUSTOM_RANGE, "core": TV_CUSTOM_RANGE_CORE, "max_seconds": TV_CUSTOM_RANGE_MAX_SECONDS, "env_aliases": {"CHART_TOTAL_TIMEOUT_SEC": os.getenv("CHART_TOTAL_TIMEOUT_SEC"), "TV_RANGE_MAX_SECONDS": os.getenv("TV_RANGE_MAX_SECONDS"), "TV_FULL_CHART_BUDGET_SECONDS": os.getenv("TV_FULL_CHART_BUDGET_SECONDS")}, "session_start": TV_CUSTOM_RANGE_START, "session_end": TV_CUSTOM_RANGE_END, "current_plus_minutes": TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES, "range_attempt_json": True}, "prepare_capture": {"enabled": True, "ttl_seconds": PREPARE_SESSION_TTL_SECONDS, "active_sessions": len(PREPARED_CHARTS), "prepare_goto_timeout_ms": TV_PREPARE_GOTO_TIMEOUT_MS}}
 
 @app.get("/debug/range-target")
 async def debug_range_target(target_date: Optional[str] = None, view: str = "session"):
@@ -1408,6 +1438,291 @@ def clear_screenshot_files(keep_last: int = 0) -> dict:
         except Exception:
             pass
     return {"deleted": deleted, "kept": min(keep_last, len(all_files))}
+
+
+class PrepareChartResponse(BaseModel):
+    ok: bool
+    version: str
+    session_id: Optional[str] = None
+    status: str
+    symbol: str
+    interval: str
+    target_date: Optional[str] = None
+    target_start: str
+    target_end: str
+    tradingview_url: str
+    range_attempt: dict = Field(default_factory=dict)
+    expires_at_utc: Optional[str] = None
+    note: str = ""
+
+class CaptureChartResponse(BaseModel):
+    ok: bool
+    version: str
+    session_id: str
+    screenshot_url: Optional[str] = None
+    chart_status: str
+    range_attempt: dict = Field(default_factory=dict)
+    note: str = ""
+    captured_at_utc: str
+
+async def _prepare_chart_internal(request: Request, symbol: str, interval: str, target_date: Optional[str], mode: str, view: str) -> dict:
+    await cleanup_prepared_charts()
+    clean_symbol = normalize_symbol(symbol)
+    if interval not in TV_INTERVALS:
+        raise HTTPException(status_code=400, detail=f"Gecersiz interval: {interval}. Destek: {', '.join(TV_INTERVALS.keys())}")
+    if view not in {"session", "full_day", "day", "auto"}:
+        raise HTTPException(status_code=400, detail="view session, full_day, day veya auto olmali.")
+    if target_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", target_date):
+        raise HTTPException(status_code=400, detail="target_date YYYY-MM-DD formatinda olmali.")
+
+    window = build_target_session_window(target_date)
+    tv_url = make_tv_url(clean_symbol, interval, view, target_date)
+    sid = uuid.uuid4().hex[:12]
+    page = None
+    stages_note = []
+    status = "failed"
+    try:
+        ctx = await BROWSER.get_context()
+        page = await ctx.new_page()
+        await install_fast_routes(page)
+        page.set_default_timeout(7000)
+        page.set_default_navigation_timeout(TV_PREPARE_GOTO_TIMEOUT_MS)
+        try:
+            await page.goto(tv_url, wait_until="domcontentloaded", timeout=TV_PREPARE_GOTO_TIMEOUT_MS)
+            stages_note.append(f"goto ok timeout_ms={TV_PREPARE_GOTO_TIMEOUT_MS}")
+        except Exception as e:
+            # Soft fail: TradingView can still expose enough DOM after timeout.
+            stages_note.append(f"goto soft-failed {type(e).__name__}: {str(e)[:160]}")
+        await click_soft_popups(page)
+        range_note = "range_attempt enabled=false"
+        if view in {"session", "full_day", "day"}:
+            try:
+                range_note = await asyncio.wait_for(
+                    try_tradingview_custom_date_range(page, target_date, view),
+                    timeout=max(6, TV_CUSTOM_RANGE_MAX_SECONDS),
+                )
+            except asyncio.TimeoutError:
+                range_note = f"range_attempt enabled=true stage=custom_range_timeboxed max_seconds={TV_CUSTOM_RANGE_MAX_SECONDS}"
+            except Exception as e:
+                range_note = f"range_attempt enabled=true stage=custom_range_failed error={type(e).__name__}: {str(e)[:160]}"
+        stages_note.append(range_note)
+        try:
+            await page.wait_for_timeout(TV_PREPARE_POST_RANGE_WAIT_MS)
+        except Exception:
+            pass
+        try:
+            await try_tradingview_fullscreen(page)
+        except Exception as e:
+            stages_note.append(f"stage=fullscreen ok=false detail={type(e).__name__}")
+        try:
+            await hover_latest_candle_column(page)
+            stages_note.append("stage=hover_last_candle ok=true")
+        except Exception as e:
+            stages_note.append(f"stage=hover_last_candle ok=false detail={type(e).__name__}")
+
+        expires_at = time.time() + PREPARE_SESSION_TTL_SECONDS
+        PREPARED_CHARTS[sid] = {
+            "page": page,
+            "symbol": clean_symbol,
+            "interval": interval,
+            "target_date": target_date,
+            "view": view,
+            "url": tv_url,
+            "created_at": time.time(),
+            "expires_at": expires_at,
+            "range_note": " | ".join(stages_note),
+            "window": window,
+        }
+        page = None  # ownership transferred to session store
+        status = "ready_for_capture"
+        note = " | ".join(stages_note)
+        range_attempt = build_range_attempt_summary(target_date, view, status, note)
+        range_attempt["stages"] = _stage_list_from_note(note)
+        return {
+            "ok": True,
+            "version": APP_VERSION,
+            "session_id": sid,
+            "status": status,
+            "symbol": clean_symbol,
+            "interval": interval,
+            "target_date": target_date,
+            "target_start": window["start_label"],
+            "target_end": window["end_label"],
+            "tradingview_url": tv_url,
+            "range_attempt": range_attempt,
+            "expires_at_utc": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
+            "note": to_ascii_tr("Prepare finished; call /capture-chart quickly. " + note),
+        }
+    except Exception as e:
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        note = " | ".join(stages_note + [f"prepare failed {type(e).__name__}: {str(e)[:200]}"])
+        range_attempt = build_range_attempt_summary(target_date, view, "prepare_failed", note)
+        range_attempt["stages"] = _stage_list_from_note(note)
+        return {
+            "ok": False,
+            "version": APP_VERSION,
+            "session_id": None,
+            "status": "prepare_failed",
+            "symbol": clean_symbol if 'clean_symbol' in locals() else symbol,
+            "interval": interval,
+            "target_date": target_date,
+            "target_start": window["start_label"] if 'window' in locals() else "",
+            "target_end": window["end_label"] if 'window' in locals() else "",
+            "tradingview_url": tv_url if 'tv_url' in locals() else "",
+            "range_attempt": range_attempt,
+            "expires_at_utc": None,
+            "note": to_ascii_tr(note),
+        }
+
+async def _capture_chart_internal(request: Request, session_id: str, close_after: bool = True, include_base64: bool = False) -> dict:
+    await cleanup_prepared_charts()
+    rec = PREPARED_CHARTS.get(session_id)
+    if not rec:
+        return {
+            "ok": False,
+            "version": APP_VERSION,
+            "session_id": session_id,
+            "screenshot_url": None,
+            "chart_status": "session_not_found_or_expired",
+            "range_attempt": {},
+            "note": "Prepared chart session not found or expired. Call /prepare-chart again and capture quickly.",
+            "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+    page = rec.get("page")
+    clean_symbol = rec.get("symbol", "SYMBOL")
+    interval = rec.get("interval", "5m")
+    target_date = rec.get("target_date")
+    view = rec.get("view", "session")
+    note_parts = [rec.get("range_note", "")]
+    img_type = "jpeg"
+    ext = "jpg"
+    filename = f"{clean_symbol}_{interval}_prepared_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}.{ext}"
+    out_path = SCREENSHOT_DIR / filename
+    shot_path = f"/screenshots/{filename}"
+    screenshot_url = None
+    chart_status = "capture_failed"
+    try:
+        if not page:
+            raise RuntimeError("prepared page missing")
+        try:
+            await click_soft_popups(page)
+        except Exception:
+            pass
+        try:
+            await hover_latest_candle_column(page)
+            note_parts.append("stage=capture_hover_last_candle ok=true")
+        except Exception as e:
+            note_parts.append(f"stage=capture_hover_last_candle ok=false detail={type(e).__name__}")
+        ok_img = await capture_and_validate(page, out_path, img_type, 84)
+        if ok_img:
+            tv_error, tv_error_note = await page_has_tradingview_symbol_error(page)
+            if tv_error:
+                chart_status = "rejected_symbol_error"
+                note_parts.append(tv_error_note)
+                try: out_path.unlink()
+                except Exception: pass
+                screenshot_url = None
+            else:
+                chart_status = "ok_prepared_capture"
+                screenshot_url = absolute_url(request, shot_path)
+                note_parts.append("stage=final_screenshot ok=true")
+        else:
+            chart_status = "prepared_capture_failed_validation"
+            note_parts.append("stage=final_screenshot ok=false detail=image_blank_loading_or_not_chart")
+            try:
+                if out_path.exists(): out_path.unlink()
+            except Exception:
+                pass
+    except Exception as e:
+        chart_status = "capture_exception"
+        note_parts.append(f"stage=final_screenshot ok=false detail={type(e).__name__}: {str(e)[:180]}")
+        try:
+            if out_path.exists(): out_path.unlink()
+        except Exception:
+            pass
+    finally:
+        if close_after:
+            PREPARED_CHARTS.pop(session_id, None)
+            try:
+                if page:
+                    await page.close()
+            except Exception:
+                pass
+    note = " | ".join([x for x in note_parts if x])
+    range_attempt = build_range_attempt_summary(target_date, view, chart_status, note)
+    range_attempt["stages"] = _stage_list_from_note(note)
+    result = {
+        "ok": bool(screenshot_url),
+        "version": APP_VERSION,
+        "session_id": session_id,
+        "screenshot_url": screenshot_url,
+        "chart_status": chart_status,
+        "range_attempt": range_attempt,
+        "note": to_ascii_tr(note),
+        "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    if include_base64 and screenshot_url and out_path.exists():
+        result["screenshot_base64_png"] = base64.b64encode(out_path.read_bytes()).decode("utf-8")
+    return result
+
+@app.get("/prepare-chart", response_model=PrepareChartResponse)
+async def prepare_chart(
+    request: Request,
+    symbol: str = Query(..., description="BIST sembolu. Ornek: THYAO"),
+    interval: str = Query("5m", description="Sabit hedef 5m; digerleri test icin."),
+    target_date: Optional[str] = Query(None, description="YYYY-MM-DD; tarihli grafik icin."),
+    mode: str = Query("current", description="current/fast/safe_current; prepare-capture modunda current onerilir."),
+    view: str = Query("session", description="session hedefi: 09:55-18:10."),
+):
+    return await _prepare_chart_internal(request, symbol, interval, target_date, mode, view)
+
+@app.get("/capture-chart", response_model=CaptureChartResponse)
+async def capture_chart(
+    request: Request,
+    session_id: str = Query(..., description="prepare-chart sonucunda gelen session_id"),
+    close_after: bool = Query(True, description="true ise screenshot sonrasi hazir sayfayi kapatir."),
+    include_base64: bool = Query(False, description="true ise base64 de doner; genelde false."),
+):
+    return await _capture_chart_internal(request, session_id, close_after, include_base64)
+
+@app.get("/prepared-sessions")
+async def prepared_sessions():
+    await cleanup_prepared_charts()
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "count": len(PREPARED_CHARTS),
+        "sessions": [
+            {
+                "session_id": sid,
+                "symbol": rec.get("symbol"),
+                "interval": rec.get("interval"),
+                "target_date": rec.get("target_date"),
+                "expires_at_utc": datetime.fromtimestamp(rec.get("expires_at", 0), timezone.utc).isoformat(),
+                "range_note": to_ascii_tr(rec.get("range_note", ""))[:600],
+            }
+            for sid, rec in PREPARED_CHARTS.items()
+        ],
+    }
+
+@app.get("/chart-agent")
+async def chart_agent(
+    request: Request,
+    symbol: str = Query(...),
+    interval: str = Query("5m"),
+    target_date: Optional[str] = Query(None),
+    mode: str = Query("current"),
+    view: str = Query("session"),
+):
+    prep = await _prepare_chart_internal(request, symbol, interval, target_date, mode, view)
+    if not prep.get("ok") or not prep.get("session_id"):
+        return {"ok": False, "version": APP_VERSION, "phase": "prepare", "prepare": prep}
+    cap = await _capture_chart_internal(request, prep["session_id"], close_after=True, include_base64=False)
+    return {"ok": bool(cap.get("screenshot_url")), "version": APP_VERSION, "phase": "capture", "prepare": prep, "capture": cap}
 
 @app.get("/screenshots-list")
 def screenshots_list(limit: int = Query(30, ge=1, le=200)):
