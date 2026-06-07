@@ -4,3 +4,4 @@ playwright==1.49.1
 pydantic==2.10.4
 pillow==11.0.0
 python-multipart==0.0.20
+tzdata==2025.2

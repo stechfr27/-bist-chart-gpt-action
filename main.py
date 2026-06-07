@@ -1,6 +1,6 @@
 import os, re, uuid, asyncio
-from datetime import datetime, timedelta, time
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, time, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -9,11 +9,15 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
-VERSION = "7.4.0-operator-mode-hard-force"
+VERSION = "7.4.1-operator-mode-tzfix"
 APP_BASE_URL = os.getenv("APP_BASE_URL", "https://bist-chart-gpt-action.onrender.com").rstrip("/")
 BROWSERLESS_WS_ENDPOINT = os.getenv("BROWSERLESS_WS_ENDPOINT", "")
 PORT = int(os.getenv("PORT", "10000"))
-TZ = ZoneInfo("Europe/Istanbul")
+try:
+    TZ = ZoneInfo("Europe/Istanbul")
+except ZoneInfoNotFoundError:
+    # Fallback for slim containers missing OS timezone data. Turkey has fixed UTC+3.
+    TZ = timezone(timedelta(hours=3), name="Europe/Istanbul")
 
 VIEWPORT_WIDTH = int(os.getenv("VIEWPORT_WIDTH", "2400"))
 VIEWPORT_HEIGHT = int(os.getenv("VIEWPORT_HEIGHT", "1350"))
