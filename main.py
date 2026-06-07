@@ -25,7 +25,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "7.0.0-prepare-capture-agent"
+APP_VERSION = "7.2.0-visual-only-final"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -119,8 +119,16 @@ class BrowserManager:
 
     async def get_context(self) -> BrowserContext:
         async with self._lock:
-            if self._context:
-                return self._context
+            # Browserless free sessions may close the remote browser/context between calls.
+            # Never return a stale context if the browser is disconnected.
+            if self._context and self._browser:
+                try:
+                    if self._browser.is_connected():
+                        return self._context
+                except Exception:
+                    pass
+                self._context = None
+                self._browser = None
             self._pw = await async_playwright().start()
             extra_headers = {}
             if TRADINGVIEW_COOKIE:
@@ -153,6 +161,27 @@ class BrowserManager:
             )
             self.started_at = datetime.now(timezone.utc).isoformat()
             return self._context
+
+    async def new_page(self, label: str = ""):
+        """Create a new page, rescuing stale Browserless contexts automatically.
+
+        This is intentionally used instead of ctx.new_page() directly because
+        Browserless free sessions can close an otherwise cached context between
+        warmup and prepare/capture calls.
+        """
+        last_error = None
+        for attempt in range(2):
+            try:
+                ctx = await self.get_context()
+                return await ctx.new_page()
+            except Exception as e:
+                last_error = e
+                msg = str(e).lower()
+                if "closed" in msg or "target" in msg or "disconnected" in msg:
+                    await self.reset()
+                    continue
+                raise
+        raise last_error
 
     async def reset(self):
         async with self._lock:
@@ -280,8 +309,7 @@ async def warmup():
     broken. The real TradingView load is tested only by /chart.
     """
     try:
-        ctx = await BROWSER.get_context()
-        page = await ctx.new_page()
+        page = await BROWSER.new_page("warmup")
         await page.goto("about:blank", wait_until="load", timeout=8000)
         await page.close()
         return {
@@ -1482,8 +1510,7 @@ async def _prepare_chart_internal(request: Request, symbol: str, interval: str, 
     stages_note = []
     status = "failed"
     try:
-        ctx = await BROWSER.get_context()
-        page = await ctx.new_page()
+        page = await BROWSER.new_page("prepare")
         await install_fast_routes(page)
         page.set_default_timeout(7000)
         page.set_default_navigation_timeout(TV_PREPARE_GOTO_TIMEOUT_MS)
