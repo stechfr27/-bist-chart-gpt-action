@@ -25,7 +25,7 @@ from starlette.concurrency import run_in_threadpool
 from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
-APP_VERSION = "7.2.0-visual-only-final"
+APP_VERSION = "7.3.0-exact-range-forced-visual"
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "/tmp/bist_chart_screenshots"))
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL_SECONDS = int(os.getenv("OHLC_CACHE_TTL_SECONDS", "300"))
@@ -69,6 +69,12 @@ TV_CUSTOM_RANGE_MAX_SECONDS = int(os.getenv("TV_CUSTOM_RANGE_MAX_SECONDS", os.ge
 TV_CUSTOM_RANGE_START = os.getenv("TV_CUSTOM_RANGE_START", BIST_SESSION_START)
 TV_CUSTOM_RANGE_END = os.getenv("TV_CUSTOM_RANGE_END", BIST_SESSION_END)
 TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES = int(os.getenv("TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES", "1"))
+# Exact visual mode: never return a screenshot as if it matched the request unless
+# TradingView custom range UI reports that target range was filled and applied.
+# This intentionally fails closed instead of returning a wrong multi-day image.
+TV_REQUIRE_EXACT_RANGE = os.getenv("TV_REQUIRE_EXACT_RANGE", "true").lower() in {"1", "true", "yes", "on"}
+TV_CUSTOM_RANGE_STRICT_FILL = os.getenv("TV_CUSTOM_RANGE_STRICT_FILL", "true").lower() in {"1", "true", "yes", "on"}
+TV_CUSTOM_RANGE_OPEN_TIMEOUT_MS = int(os.getenv("TV_CUSTOM_RANGE_OPEN_TIMEOUT_MS", "1200"))
 TV_IMAGE_DETECT_LAST_CANDLE = os.getenv("TV_IMAGE_DETECT_LAST_CANDLE", "true").lower() in {"1", "true", "yes", "on"}
 
 # TradingView UI adjustment: try to maximize graph area and place the crosshair just above
@@ -277,7 +283,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END, "strict_note": BIST_SESSION_STRICT_NOTE}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO, "image_detect_last_candle": TV_IMAGE_DETECT_LAST_CANDLE}, "custom_range": {"enabled": TV_USE_CUSTOM_RANGE, "core": TV_CUSTOM_RANGE_CORE, "max_seconds": TV_CUSTOM_RANGE_MAX_SECONDS, "env_aliases": {"CHART_TOTAL_TIMEOUT_SEC": os.getenv("CHART_TOTAL_TIMEOUT_SEC"), "TV_RANGE_MAX_SECONDS": os.getenv("TV_RANGE_MAX_SECONDS"), "TV_FULL_CHART_BUDGET_SECONDS": os.getenv("TV_FULL_CHART_BUDGET_SECONDS")}, "session_start": TV_CUSTOM_RANGE_START, "session_end": TV_CUSTOM_RANGE_END, "current_plus_minutes": TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES, "range_attempt_json": True}, "prepare_capture": {"enabled": True, "ttl_seconds": PREPARE_SESSION_TTL_SECONDS, "active_sessions": len(PREPARED_CHARTS), "prepare_goto_timeout_ms": TV_PREPARE_GOTO_TIMEOUT_MS}}
+    return {"ok": True, "service": "bist-chart-gpt-action", "version": APP_VERSION, "browser_started_at": BROWSER.started_at, "browserless_configured": bool(BROWSERLESS_WS_ENDPOINT), "browser_mode": "browserless_remote" if BROWSERLESS_WS_ENDPOINT else "local_fallback", "viewport": {"width": TV_VIEWPORT_WIDTH, "height": TV_VIEWPORT_HEIGHT}, "session_fit": {"zoom_steps": SESSION_ZOOM_STEPS, "wheel_delta": SESSION_ZOOM_WHEEL_DELTA, "x_ratio": SESSION_ZOOM_X_RATIO, "y_ratio": SESSION_ZOOM_Y_RATIO}, "chart_capture": {"chart_only": CHART_ONLY_SCREENSHOT, "clip_width_ratio": CHART_CLIP_WIDTH_RATIO, "clip_height_ratio": CHART_CLIP_HEIGHT_RATIO, "session_left_crop_ratio": SESSION_LEFT_CROP_RATIO}, "bist_session_target": {"start": BIST_SESSION_START, "end": BIST_SESSION_END, "strict_note": BIST_SESSION_STRICT_NOTE}, "tv_ui": {"force_fullscreen": TV_FORCE_FULLSCREEN, "hover_last_candle": TV_HOVER_LAST_CANDLE, "click_last_candle_column": TV_CLICK_LAST_CANDLE_COLUMN, "last_candle_x_ratio": TV_LAST_CANDLE_X_RATIO, "last_candle_y_ratio": TV_LAST_CANDLE_Y_RATIO, "image_detect_last_candle": TV_IMAGE_DETECT_LAST_CANDLE}, "custom_range": {"enabled": TV_USE_CUSTOM_RANGE, "core": TV_CUSTOM_RANGE_CORE, "max_seconds": TV_CUSTOM_RANGE_MAX_SECONDS, "env_aliases": {"CHART_TOTAL_TIMEOUT_SEC": os.getenv("CHART_TOTAL_TIMEOUT_SEC"), "TV_RANGE_MAX_SECONDS": os.getenv("TV_RANGE_MAX_SECONDS"), "TV_FULL_CHART_BUDGET_SECONDS": os.getenv("TV_FULL_CHART_BUDGET_SECONDS")}, "session_start": TV_CUSTOM_RANGE_START, "session_end": TV_CUSTOM_RANGE_END, "current_plus_minutes": TV_CUSTOM_RANGE_CURRENT_PLUS_MINUTES, "require_exact_range": TV_REQUIRE_EXACT_RANGE, "strict_fill": TV_CUSTOM_RANGE_STRICT_FILL, "range_attempt_json": True}, "prepare_capture": {"enabled": True, "ttl_seconds": PREPARE_SESSION_TTL_SECONDS, "active_sessions": len(PREPARED_CHARTS), "prepare_goto_timeout_ms": TV_PREPARE_GOTO_TIMEOUT_MS}}
 
 @app.get("/debug/range-target")
 async def debug_range_target(target_date: Optional[str] = None, view: str = "session"):
@@ -515,6 +521,21 @@ def build_target_session_window(target_date: Optional[str]) -> dict:
     }
 
 
+
+def range_note_has_success(note: str) -> bool:
+    """Return True only when the exact-range UI appears to have been filled and applied.
+
+    This is intentionally strict. A plain TradingView screenshot is not enough for the
+    user's visual-only GPT, because it can show multiple days. Exact mode must fail
+    closed unless start/end fill and apply stages are both confirmed.
+    """
+    if not TV_USE_CUSTOM_RANGE:
+        return False
+    required = ["stage=fill_start_end ok=true", "stage=apply_range ok=true"]
+    if TV_CUSTOM_RANGE_STRICT_FILL:
+        required.append("stage=open_range_menu ok=true")
+    return all(token in (note or "") for token in required)
+
 def build_range_attempt_summary(target_date: Optional[str], view: str, chart_status: str = "", chart_note: str = "") -> dict:
     """Always expose the custom-range target and debug state as JSON.
 
@@ -648,40 +669,80 @@ async def try_tradingview_custom_date_range(page: Page, target_date: Optional[st
         # Some locales open the date input directly; don't fail yet.
         add("choose_custom_range", False, "custom_text_not_found; will_try_visible_inputs_anyway")
 
-    # 3) Fill start/end inputs. Try several format pairs because TradingView locale differs.
+    # 3) Fill start/end inputs. TradingView locale changes between combined
+    # datetime fields and split date/time fields. Try split 4-input fill first,
+    # then combined 2-input fill. The range is considered usable only if we can
+    # write both target start and target end.
+    def _date_formats(dt):
+        return [dt.strftime("%d.%m.%Y"), dt.strftime("%Y-%m-%d"), dt.strftime("%d/%m/%Y"), dt.strftime("%m/%d/%Y")]
+
+    def _time_formats(dt):
+        return [dt.strftime("%H:%M")]
+
     format_pairs = [
         (window["start"].strftime("%d.%m.%Y %H:%M"), window["end"].strftime("%d.%m.%Y %H:%M")),
         (window["start"].strftime("%Y-%m-%d %H:%M"), window["end"].strftime("%Y-%m-%d %H:%M")),
-        (window["start"].strftime("%m/%d/%Y %H:%M"), window["end"].strftime("%m/%d/%Y %H:%M")),
         (window["start"].strftime("%d/%m/%Y %H:%M"), window["end"].strftime("%d/%m/%Y %H:%M")),
+        (window["start"].strftime("%m/%d/%Y %H:%M"), window["end"].strftime("%m/%d/%Y %H:%M")),
     ]
     filled = False
     input_count = 0
     try:
         inputs = page.locator("input")
         input_count = await inputs.count()
-        count = min(input_count, 8)
-        # Prefer visible writable inputs from left/top order. Fill first two only.
-        for start_val, end_val in format_pairs:
-            written = 0
-            for i in range(count):
-                if written >= 2:
+        count = min(input_count, 12)
+
+        async def write_input(index: int, value: str):
+            inp = inputs.nth(index)
+            await inp.click(timeout=650)
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.type(value, delay=10)
+            await page.wait_for_timeout(80)
+
+        # Split date/time UI: date, time, date, time (or similar).
+        if count >= 4:
+            for sd in _date_formats(window["start"]):
+                for ed in _date_formats(window["end"]):
+                    try:
+                        visible = []
+                        for i in range(count):
+                            try:
+                                if await inputs.nth(i).is_visible(timeout=180):
+                                    visible.append(i)
+                            except Exception:
+                                pass
+                        if len(visible) >= 4:
+                            vals = [sd, _time_formats(window["start"])[0], ed, _time_formats(window["end"])[0]]
+                            for idx, val in zip(visible[:4], vals):
+                                await write_input(idx, val)
+                            filled = True
+                            add("fill_start_end", True, f"split4 start={sd} {_time_formats(window['start'])[0]} end={ed} {_time_formats(window['end'])[0]}; input_count={input_count}")
+                            break
+                    except Exception:
+                        pass
+                if filled:
                     break
+
+        # Combined datetime UI: start datetime, end datetime.
+        if not filled and count >= 2:
+            for start_val, end_val in format_pairs:
                 try:
-                    inp = inputs.nth(i)
-                    if await inp.is_visible(timeout=220):
-                        await inp.click(timeout=450)
-                        await page.keyboard.press("Control+A")
-                        await page.keyboard.press("Backspace")
-                        await page.keyboard.type(start_val if written == 0 else end_val, delay=8)
-                        written += 1
-                        await page.wait_for_timeout(90)
+                    visible = []
+                    for i in range(count):
+                        try:
+                            if await inputs.nth(i).is_visible(timeout=180):
+                                visible.append(i)
+                        except Exception:
+                            pass
+                    if len(visible) >= 2:
+                        await write_input(visible[0], start_val)
+                        await write_input(visible[1], end_val)
+                        filled = True
+                        add("fill_start_end", True, f"combined start={start_val} end={end_val}; input_count={input_count}")
+                        break
                 except Exception:
                     pass
-            if written >= 2:
-                filled = True
-                add("fill_start_end", True, f"format_pair={start_val}->{end_val}; input_count={input_count}")
-                break
     except Exception as e:
         add("fill_start_end", False, f"{type(e).__name__}: {e}")
     if not filled:
@@ -1533,6 +1594,32 @@ async def _prepare_chart_internal(request: Request, symbol: str, interval: str, 
             except Exception as e:
                 range_note = f"range_attempt enabled=true stage=custom_range_failed error={type(e).__name__}: {str(e)[:160]}"
         stages_note.append(range_note)
+        # Exact visual-only mode: do not continue to capture if the requested
+        # 09:55-18:10 custom range was not demonstrably applied. This prevents
+        # returning misleading multi-day TradingView screenshots.
+        if TV_REQUIRE_EXACT_RANGE and view in {"session", "full_day", "day"} and not range_note_has_success(range_note):
+            note = " | ".join(stages_note + ["stage=exact_range_required ok=false detail=custom_range_not_confirmed"])
+            range_attempt = build_range_attempt_summary(target_date, view, "prepare_failed_exact_range_not_confirmed", note)
+            range_attempt["stages"] = _stage_list_from_note(note)
+            try:
+                await page.close()
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "version": APP_VERSION,
+                "session_id": None,
+                "status": "prepare_failed_exact_range_not_confirmed",
+                "symbol": clean_symbol,
+                "interval": interval,
+                "target_date": target_date,
+                "target_start": window["start_label"],
+                "target_end": window["end_label"],
+                "tradingview_url": tv_url,
+                "range_attempt": range_attempt,
+                "expires_at_utc": None,
+                "note": to_ascii_tr("Exact custom range could not be confirmed. No screenshot will be returned because wrong-date/multi-day charts are forbidden. " + note),
+            }
         try:
             await page.wait_for_timeout(TV_PREPARE_POST_RANGE_WAIT_MS)
         except Exception:

@@ -1,16 +1,26 @@
-# BIST Grafik Görseli Getirici v7.2
+# BIST Chart GPT Action v7.3 - Exact Range Forced Visual
 
-Bu sürümün tek görevi grafik görseli üretmektir. Teknik analiz yapmaz.
+Bu sürüm analiz yapmaz; sadece istenen BIST grafiğini görsel olarak üretmeye çalışır.
 
-## Ana akış
-1. `/prepare-chart` grafiği hazırlar ve `session_id` döndürür.
-2. `/capture-chart` bu session ile screenshot alır ve `screenshot_url` döndürür.
-3. Custom GPT kullanıcıya sadece görsel linkini verir.
+Yeni kritik kural: Yanlış/multi-day TradingView ekranı dönmek yasaktır. `TV_REQUIRE_EXACT_RANGE=true` varsayılandır. TradingView custom range menüsü üzerinden 09:55-18:10 aralığı doldurulup uygulanmadıysa `prepare_failed_exact_range_not_confirmed` döner ve screenshot engellenir.
 
-## Custom GPT
-- `gpt_schema_v7.json` dosyasını Actions schema alanına yapıştır.
-- `custom_gpt_prompt_v7.txt` dosyasını Instructions alanına yapıştır.
-- Server URL kısmını kendi Render URL'inle aynı bırak/değiştir.
+## Health
+`/health` içinde version şu olmalı:
+`7.3.0-exact-range-forced-visual`
+
+## Akış
+1. `/prepare-chart?symbol=THYAO&interval=5m&target_date=2026-06-02&view=session`
+2. `session_id` gelirse `/capture-chart?session_id=...`
+
+## Önerilen env
+- BROWSERLESS_WS_ENDPOINT=...
+- CHART_TOTAL_TIMEOUT_SEC=58
+- TV_RANGE_MAX_SECONDS=16
+- TV_USE_CUSTOM_RANGE=true
+- TV_REQUIRE_EXACT_RANGE=true
+- TV_CUSTOM_RANGE_STRICT_FILL=true
+- TV_HOVER_LAST_CANDLE=true
+- TV_CLICK_LAST_CANDLE_COLUMN=false
 
 ## Önemli
-`screenshot_url` yoksa grafik alınamamış demektir. Bu durumda analiz veya yorum yapılmaz.
+Bu sürüm “zorla doğru grafik” prensibiyle fail-closed çalışır: yanlış tarih/seans görüntüsü döndürmez.
